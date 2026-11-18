@@ -440,6 +440,191 @@
 
   // src/plugin.ts
   var import_plugin_sdk = __toESM(require_src());
+
+  // src/dnspod.ts
+  var DNSPOD_HOST = "dnspod.tencentcloudapi.com";
+  var DNSPOD_DEFAULT_TTL = 600;
+  var DNSPodError = class extends Error {
+    constructor(code, message) {
+      super(message);
+      this.code = code;
+      this.name = "DNSPodError";
+    }
+  };
+  async function request(credentials, action, params) {
+    const crypto = __require("crypto");
+    const hash = (value) => crypto.createHash("sha256").update(value).digest("hex");
+    const hmac = (key, value) => crypto.createHmac("sha256", key).update(value);
+    const body = JSON.stringify(params);
+    const timestamp = Math.floor(Date.now() / 1e3);
+    const date = new Date(timestamp * 1e3).toISOString().slice(0, 10);
+    const contentType = "application/json; charset=utf-8";
+    const scope = `${date}/dnspod/tc3_request`;
+    const signedHeaders = "content-type;host;x-tc-action";
+    const canonicalHeaders = `content-type:${contentType}
+host:${DNSPOD_HOST}
+x-tc-action:${action.toLowerCase()}
+`;
+    const canonicalRequest = ["POST", "/", "", canonicalHeaders, signedHeaders, hash(body)].join("\n");
+    const algorithm = "TC3-HMAC-SHA256";
+    const stringToSign = [algorithm, timestamp, scope, hash(canonicalRequest)].join("\n");
+    const dateKey = hmac("TC3" + credentials.secretKey, date).digest();
+    const serviceKey = hmac(dateKey, "dnspod").digest();
+    const signingKey = hmac(serviceKey, "tc3_request").digest();
+    const signature = hmac(signingKey, stringToSign).digest("hex");
+    const response = await fetch(`https://${DNSPOD_HOST}/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        "X-TC-Action": action,
+        "X-TC-Version": "2021-03-23",
+        "X-TC-Timestamp": String(timestamp),
+        Authorization: `${algorithm} Credential=${credentials.secretId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+      },
+      body
+    });
+    const data = (await response.json())?.Response;
+    if (data?.Error) {
+      throw new DNSPodError(
+        data.Error.Code,
+        `${action}: ${data.Error.Code} ${data.Error.Message} (RequestId: ${data.RequestId})`
+      );
+    }
+    if (!response.ok || !data) {
+      throw new Error(`DNSPod ${action}: HTTP ${response.status} \u6216\u54CD\u5E94\u683C\u5F0F\u5F02\u5E38`);
+    }
+    return data;
+  }
+  function isLineId(line) {
+    return /^\d+(?:=\d+)*$/.test(line);
+  }
+  async function listDNSPodLines(credentials, domain) {
+    const { LineList } = await request(
+      credentials,
+      "DescribeRecordLineCategoryList",
+      { Domain: domain }
+    );
+    if (!Array.isArray(LineList)) throw new Error("DNSPod \u7EBF\u8DEF\u5217\u8868\u54CD\u5E94\u683C\u5F0F\u5F02\u5E38");
+    const lines = /* @__PURE__ */ new Map();
+    function collect(items) {
+      for (const { LineName: name, LineId: id, Useful, SubGroup } of items) {
+        if (Useful && name) {
+          const value = id === "0" ? "\u9ED8\u8BA4" : id && isLineId(id) ? id : name;
+          lines.set(value, { id, name, value });
+        }
+        if (SubGroup) collect(SubGroup);
+      }
+    }
+    collect(LineList);
+    return Array.from(lines.values());
+  }
+  async function findRecords(credentials, options, lineId) {
+    const records = [];
+    const limit = 100;
+    for (let offset = 0; ; offset += limit) {
+      let page;
+      try {
+        page = await request(
+          credentials,
+          "DescribeRecordList",
+          {
+            Domain: options.domain,
+            SubDomain: options.subdomain,
+            RecordType: options.type,
+            ...lineId ? { RecordLineId: options.line } : { RecordLine: options.line },
+            Offset: offset,
+            Limit: limit
+          }
+        );
+      } catch (e) {
+        if (e instanceof DNSPodError && e.code === "ResourceNotFound.NoDataOfRecord") break;
+        throw e;
+      }
+      const items = page.RecordList;
+      if (!Array.isArray(items)) throw new Error("DNSPod \u89E3\u6790\u8BB0\u5F55\u5217\u8868\u54CD\u5E94\u683C\u5F0F\u5F02\u5E38");
+      for (const record of items) {
+        if (record.Name.toLowerCase() === options.subdomain && record.Type === options.type && (lineId ? record.LineId : record.Line) === options.line) {
+          records.push(record);
+          if (records.length === 2) return records;
+        }
+      }
+      if (items.length < limit) break;
+    }
+    return records;
+  }
+  async function describeRecord(credentials, domain, recordId) {
+    const { RecordInfo: info } = await request(credentials, "DescribeRecord", { Domain: domain, RecordId: recordId });
+    return {
+      RecordId: info.Id,
+      Name: info.SubDomain,
+      Type: info.RecordType,
+      Line: info.RecordLine,
+      LineId: info.RecordLineId,
+      Value: info.Value,
+      Weight: info.Weight,
+      TTL: info.TTL
+    };
+  }
+  async function syncDNSPodRecord(credentials, options, ip, claimedRecords, recentlyCreatedId) {
+    const { domain, subdomain, type, line, recordId, weight, ttl } = options;
+    const lineId = isLineId(line);
+    let record;
+    if (recordId !== void 0) {
+      record = await describeRecord(credentials, domain, recordId);
+      if (record.RecordId !== recordId || record.Name.toLowerCase() !== subdomain || record.Type !== type) {
+        throw new Error("DNSPod \u8BB0\u5F55 ID \u4E0E\u914D\u7F6E\u7684\u4E3B\u673A\u540D\u6216\u8BB0\u5F55\u7C7B\u578B\u4E0D\u5339\u914D");
+      }
+    } else {
+      const matches = await findRecords(credentials, options, lineId);
+      if (matches.length > 1) {
+        throw new Error("DNSPod \u540C\u540D\u3001\u540C\u7C7B\u578B\u3001\u540C\u7EBF\u8DEF\u6709\u591A\u6761\u8BB0\u5F55\uFF0C\u8BF7\u586B\u5199 DNSPod \u8BB0\u5F55 ID");
+      }
+      record = matches[0];
+      if (!record && recentlyCreatedId !== void 0) {
+        record = await describeRecord(credentials, domain, recentlyCreatedId);
+        if (record.Name.toLowerCase() !== subdomain || record.Type !== type || (lineId ? record.LineId : record.Line) !== line) {
+          throw new Error("DNSPod \u521A\u521B\u5EFA\u7684\u8BB0\u5F55\u5DF2\u53D8\u66F4\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
+        }
+      }
+    }
+    if (!record) {
+      const created = await request(credentials, "CreateRecord", {
+        Domain: domain,
+        SubDomain: subdomain,
+        RecordType: type,
+        RecordLine: lineId ? "\u9ED8\u8BA4" : line,
+        ...lineId ? { RecordLineId: line } : {},
+        Value: ip,
+        TTL: ttl ?? DNSPOD_DEFAULT_TTL,
+        Weight: weight
+      });
+      claimedRecords.add(`${domain}#${created.RecordId}`);
+      return { action: "create", id: created.RecordId };
+    }
+    const claim = `${domain}#${record.RecordId}`;
+    if (claimedRecords.has(claim)) throw new Error("\u591A\u6761 DDNS \u914D\u7F6E\u6307\u5411\u540C\u4E00\u4E2A DNSPod \u8BB0\u5F55 ID");
+    claimedRecords.add(claim);
+    const fields = [];
+    if (record.Value !== ip) fields.push({ Key: "value", Value: ip });
+    if ((lineId ? record.LineId : record.Line) !== line) {
+      fields.push({ Key: lineId ? "record_line_id" : "record_line", Value: line });
+    }
+    if (weight !== void 0 && weight !== (record.Weight ?? 0)) {
+      fields.push({ Key: "weight", Value: String(weight) });
+    }
+    if (ttl !== void 0 && ttl !== record.TTL) {
+      fields.push({ Key: "ttl", Value: String(ttl) });
+    }
+    if (fields.length === 0) return { action: "skip", id: record.RecordId };
+    await request(credentials, "ModifyRecordFields", {
+      Domain: domain,
+      RecordId: record.RecordId,
+      FieldList: fields
+    });
+    return { action: "update", id: record.RecordId };
+  }
+
+  // src/plugin.ts
   var fs = __require("fs");
   var path = __require("path");
   var CF_API = "https://api.cloudflare.com/client/v4";
@@ -513,8 +698,41 @@
     }
     return stored;
   }
-  function recordKey(name, type) {
-    return `${name}#${type}`;
+  function recordKey(rec) {
+    if (rec.provider !== "dnspod") return `${rec.record_name}#${rec.record_type}`;
+    const target = rec.record_id ? `id:${rec.record_id}` : `line:${rec.record_line || "\u9ED8\u8BA4"}`;
+    return `dnspod:${rec.domain}#${rec.record_name}#${rec.record_type}#${target}`;
+  }
+  function normalizeDNSName(value) {
+    return String(value ?? "").trim().toLowerCase().replace(/\.$/, "");
+  }
+  function dnsPodCredentials(config) {
+    const secretId = String(config.tencent_secret_id ?? "").trim();
+    const secretKey = String(config.tencent_secret_key ?? "").trim();
+    if (!secretId || !secretKey) throw new Error("\u8BF7\u5728\u63D2\u4EF6\u914D\u7F6E\u4E2D\u586B\u5199\u817E\u8BAF\u4E91 SecretId \u548C SecretKey");
+    return { secretId, secretKey };
+  }
+  function configuredDNSPodTTL(rec) {
+    return rec.ttl_seconds !== void 0 ? rec.ttl_seconds : rec.ttl === 1 ? void 0 : rec.ttl;
+  }
+  function normalizeDNSPodRecord(rec) {
+    const domain = normalizeDNSName(rec.domain);
+    const name = normalizeDNSName(rec.record_name);
+    if (!domain.includes(".") || name !== domain && !name.endsWith("." + domain)) {
+      throw new Error("\u89E3\u6790\u57DF\u540D\u5FC5\u987B\u662F\u8BB0\u5F55\u540D\u79F0\u672C\u8EAB\u6216\u5176\u4E0A\u7EA7\u57DF\u540D");
+    }
+    if (rec.weight !== void 0 && (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > 100)) {
+      throw new Error("\u6743\u91CD\u5FC5\u987B\u662F 0 \u5230 100 \u7684\u6574\u6570\uFF0C\u6216\u7559\u7A7A");
+    }
+    if (rec.record_id !== void 0 && (!Number.isSafeInteger(rec.record_id) || rec.record_id < 1)) {
+      throw new Error("DNSPod \u8BB0\u5F55 ID \u5FC5\u987B\u662F\u6B63\u6574\u6570\uFF0C\u6216\u7559\u7A7A");
+    }
+    const ttl = configuredDNSPodTTL(rec);
+    if (ttl !== void 0 && (!Number.isInteger(ttl) || ttl < 1 || ttl > 604800)) {
+      throw new Error("DNSPod TTL \u5FC5\u987B\u4E3A 1 \u5230 604800 \u79D2\u7684\u6574\u6570");
+    }
+    const line = String(rec.record_line ?? "").trim();
+    return { ...rec, domain, record_name: name, record_line: !line || line === "0" ? "\u9ED8\u8BA4" : line, ttl: void 0, ttl_seconds: ttl };
   }
   function parseRecords(config) {
     const raw = config.records;
@@ -535,7 +753,7 @@
       record_name: String(r.record_name || ""),
       record_type: r.record_type === "AAAA" ? "AAAA" : "A",
       source_node: Array.isArray(r.source_node) ? r.source_node.map((x) => String(x)) : [],
-      ttl: Number(r.ttl) || 60,
+      ttl: Number(r.ttl) || 1,
       proxied: !!r.proxied,
       comment: r.comment ? String(r.comment) : void 0,
       api_token: r.api_token ? String(r.api_token) : void 0
@@ -668,6 +886,9 @@
       time: (/* @__PURE__ */ new Date()).toISOString(),
       record_name: rec.record_name,
       record_type: rec.record_type,
+      provider: rec.provider,
+      record_line: rec.record_line,
+      record_id: rec.record_id,
       action,
       success,
       detail,
@@ -675,132 +896,110 @@
     });
   }
   async function syncRecord(config, rec, ctx) {
-    const key = recordKey(rec.record_name, rec.record_type);
+    const key = recordKey(rec);
     const result = {
       key,
       record_name: rec.record_name,
       record_type: rec.record_type,
       zone_id: rec.zone_id
     };
-    const token = rec.api_token || config.api_token;
-    const sourceNode = rec.source_node && rec.source_node.length ? rec.source_node : [];
-    if (!token || !rec.record_name || !sourceNode || sourceNode.length === 0) {
-      result.error = "\u914D\u7F6E\u4E0D\u5B8C\u6574\uFF08\u7F3A\u5C11 token / record_name / \u6765\u6E90\u8282\u70B9\uFF09";
-      logSync(rec, "error", false, result.error);
-      return result;
-    }
-    const target = await resolveTargetIp(ctx, sourceNode, rec.record_type);
-    if (!target) {
-      result.skipped = "no valid node IP";
-      logSync(rec, "skip", true, "\u65E0\u53EF\u7528\u8282\u70B9\u516C\u7F51 IP");
-      return result;
-    }
-    console.log(
-      `[cf-ddns] [${rec.record_name}] resolved target: ${target.name} -> ${target.ip}`
-    );
-    let zoneId = rec.zone_id;
-    if (!zoneId) {
-      try {
-        const zones = await getZones(token);
-        const z = zoneForRecord(zones, rec.record_name);
-        if (!z) {
-          result.error = "\u65E0\u6CD5\u81EA\u52A8\u89E3\u6790 Zone ID\uFF08\u8BB0\u5F55\u540D " + rec.record_name + " \u5728 Cloudflare \u8D26\u53F7\u4E0B\u627E\u4E0D\u5230\u5BF9\u5E94\u57DF\u540D\uFF0C\u53EF\u5728\u8BB0\u5F55\u4E2D\u624B\u52A8\u586B\u5199 zone_id \u8986\u76D6\uFF09";
-          logSync(rec, "error", false, result.error);
-          return result;
-        }
-        zoneId = z.id;
-        console.log(
-          `[cf-ddns] [${rec.record_name}] auto-resolved zone ${z.name} (${zoneId})`
-        );
-      } catch (e) {
-        result.error = String(e);
-        logSync(rec, "error", false, result.error);
+    try {
+      if (!rec.record_name || !rec.source_node?.length) {
+        throw new Error("\u914D\u7F6E\u4E0D\u5B8C\u6574\uFF08\u7F3A\u5C11\u8BB0\u5F55\u540D\u79F0\u6216\u6765\u6E90\u8282\u70B9\uFF09");
+      }
+      const target = await resolveTargetIp(ctx, rec.source_node, rec.record_type);
+      if (!target) {
+        result.skipped = "no valid node IP";
+        logSync(rec, "skip", true, "\u65E0\u53EF\u7528\u8282\u70B9\u516C\u7F51 IP");
         return result;
       }
-    }
-    let record = null;
-    try {
-      record = await cloudflareList(
-        token,
-        zoneId,
-        rec.record_name,
-        rec.record_type
-      );
+      const previous = loadState()[key] || {};
+      let createdId;
+      let action;
+      let skipDetail;
+      if (rec.provider === "dnspod") {
+        const dns = normalizeDNSPodRecord(rec);
+        const domain = dns.domain;
+        const synced = await syncDNSPodRecord(
+          dnsPodCredentials(config),
+          {
+            domain,
+            subdomain: dns.record_name === domain ? "@" : dns.record_name.slice(0, -(domain.length + 1)),
+            type: dns.record_type,
+            line: dns.record_line,
+            recordId: dns.record_id,
+            weight: dns.weight,
+            ttl: dns.ttl_seconds
+          },
+          target.ip,
+          ctx.claimedDNSPodRecords,
+          Date.now() - previous.dnspod_created_at < 3e4 ? previous.dnspod_created_id : void 0
+        );
+        action = synced.action;
+        if (action === "create") createdId = synced.id;
+        skipDetail = "DNSPod \u89E3\u6790\u8BB0\u5F55\u5DF2\u7B26\u5408\u914D\u7F6E";
+      } else {
+        const token = rec.api_token || config.api_token;
+        if (!token) throw new Error("\u8BF7\u914D\u7F6E Cloudflare API Token");
+        action = await syncCloudflareRecord(token, rec, target.ip);
+        skipDetail = "IP \u4E0E\u4EE3\u7406\u72B6\u6001\u5747\u65E0\u53D8\u5316";
+      }
+      result.current_ip = target.ip;
+      if (action === "skip") {
+        result.updated = false;
+        result.skipped = "no change";
+        logSync(rec, "skip", true, skipDetail);
+      } else {
+        const verb = action === "create" ? "\u521B\u5EFA" : "\u66F4\u65B0";
+        result[action === "create" ? "created" : "updated"] = true;
+        logSync(rec, action, true, `${verb} DNS \u8BB0\u5F55 \u2192 ${target.ip}`, target.ip);
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const state = loadState();
+      state[key] = {
+        record_name: rec.record_name,
+        record_type: rec.record_type,
+        last_ip: target.ip,
+        last_node: target.name,
+        last_checked_at: now,
+        last_update_at: action === "skip" ? previous.last_update_at : now,
+        dnspod_created_id: createdId ?? previous.dnspod_created_id,
+        dnspod_created_at: createdId === void 0 ? previous.dnspod_created_at : Date.now()
+      };
+      saveState(state);
+      if (action !== "skip" && config.notify) {
+        await sendNotify(config, rec, target, action === "create" ? "\u521B\u5EFA" : "\u66F4\u65B0");
+      }
     } catch (e) {
       result.error = String(e);
       logSync(rec, "error", false, result.error);
-      return result;
     }
+    return result;
+  }
+  async function syncCloudflareRecord(token, rec, ip) {
+    let zoneId = rec.zone_id;
+    if (!zoneId) {
+      const zone = zoneForRecord(await getZones(token), rec.record_name);
+      if (!zone) {
+        throw new Error(`\u65E0\u6CD5\u81EA\u52A8\u89E3\u6790 Zone ID\uFF08\u8BB0\u5F55\u540D ${rec.record_name} \u5728 Cloudflare \u8D26\u53F7\u4E0B\u627E\u4E0D\u5230\u5BF9\u5E94\u57DF\u540D\uFF0C\u53EF\u5728\u8BB0\u5F55\u4E2D\u624B\u52A8\u586B\u5199 zone_id \u8986\u76D6\uFF09`);
+      }
+      zoneId = zone.id;
+    }
+    const record = await cloudflareList(token, zoneId, rec.record_name, rec.record_type);
     const payload = {
       type: rec.record_type,
       name: rec.record_name,
-      content: target.ip,
-      ttl: rec.ttl || 60,
+      content: ip,
+      ttl: rec.ttl || 1,
       proxied: !!rec.proxied
     };
-    const st = loadState();
-    const prev = st[key] || {};
     if (!record) {
-      try {
-        record = await cloudflareCreate(token, zoneId, payload);
-      } catch (e) {
-        result.error = String(e);
-        logSync(rec, "error", false, result.error);
-        return result;
-      }
-      console.log(
-        `[cf-ddns] [${rec.record_name}] created -> ${target.ip} (id ${record.id})`
-      );
-      result.created = true;
-      result.current_ip = target.ip;
-      logSync(rec, "create", true, `\u521B\u5EFA DNS \u8BB0\u5F55 \u2192 ${target.ip}`, target.ip);
-    } else {
-      const wantProxied = !!rec.proxied;
-      const ipChanged = record.content !== target.ip;
-      const proxiedChanged = record.proxied !== wantProxied;
-      if (!ipChanged && !proxiedChanged) {
-        console.log(
-          `[cf-ddns] [${rec.record_name}] already points to ${target.ip} (proxied=${wantProxied}), no change`
-        );
-        result.updated = false;
-        result.skipped = "no change";
-        result.current_ip = target.ip;
-        logSync(rec, "skip", true, "IP \u4E0E\u4EE3\u7406\u72B6\u6001\u5747\u65E0\u53D8\u5316");
-      } else {
-        try {
-          await cloudflareUpdate(token, zoneId, record.id, payload);
-          console.log(
-            `[cf-ddns] [${rec.record_name}] updated -> ${target.ip} (proxied=${wantProxied})`
-          );
-          result.updated = true;
-          result.current_ip = target.ip;
-          logSync(
-            rec,
-            "update",
-            true,
-            `\u66F4\u65B0 DNS \u8BB0\u5F55 \u2192 ${target.ip}${proxiedChanged ? "\uFF08\u4EE3\u7406\u72B6\u6001\u53D8\u66F4\uFF09" : ""}`,
-            target.ip
-          );
-        } catch (e) {
-          result.error = String(e);
-          logSync(rec, "error", false, result.error);
-          return result;
-        }
-      }
+      await cloudflareCreate(token, zoneId, payload);
+      return "create";
     }
-    st[key] = {
-      record_name: rec.record_name,
-      record_type: rec.record_type,
-      last_ip: target.ip,
-      last_node: target.name,
-      last_checked_at: (/* @__PURE__ */ new Date()).toISOString(),
-      last_update_at: result.updated || result.created ? (/* @__PURE__ */ new Date()).toISOString() : prev.last_update_at
-    };
-    saveState(st);
-    if ((result.updated || result.created) && config.notify) {
-      await sendNotify(config, rec, target, result.created ? "\u521B\u5EFA" : "\u66F4\u65B0");
-    }
-    return result;
+    if (record.content === ip && record.proxied === payload.proxied) return "skip";
+    await cloudflareUpdate(token, zoneId, record.id, payload);
+    return "update";
   }
   async function sendNotify(config, rec, target, verb) {
     if (!config.notify) return;
@@ -809,7 +1008,7 @@
         event: {
           event: "DDNS",
           emoji: "\u{1F310}",
-          message: `DDNS ${verb}\uFF1A${rec.record_name} \u2192 ${target.ip}\uFF08\u8282\u70B9 ${target.name}\uFF09`,
+          message: `DDNS ${verb}\uFF1A${rec.record_name}${rec.provider === "dnspod" ? ` [${rec.record_line || "\u9ED8\u8BA4"}]` : ""} \u2192 ${target.ip}\uFF08\u8282\u70B9 ${target.name}\uFF09`,
           time: (/* @__PURE__ */ new Date()).toISOString(),
           clients: [{ uuid: target.uuid }]
         }
@@ -818,7 +1017,16 @@
       console.warn("[cf-ddns] notify failed:", e);
     }
   }
-  async function syncOnce() {
+  var activeSync;
+  function syncOnce() {
+    if (!activeSync) {
+      activeSync = syncAllRecords().finally(() => {
+        activeSync = void 0;
+      });
+    }
+    return activeSync;
+  }
+  async function syncAllRecords() {
     const config = await import_plugin_sdk.server.getConfig();
     const list = getRecords(config);
     if (list.length === 0) {
@@ -841,14 +1049,14 @@
         e
       );
     }
-    const ctx = { nodes, statuses };
+    const ctx = { nodes, statuses, claimedDNSPodRecords: /* @__PURE__ */ new Set() };
     const results = [];
     for (const r of list) {
       try {
         results.push(await syncRecord(config, r, ctx));
       } catch (e) {
         results.push({
-          key: recordKey(r.record_name, r.record_type),
+          key: recordKey(r),
           record_name: r.record_name,
           record_type: r.record_type,
           error: String(e)
@@ -952,6 +1160,24 @@
           (0, import_plugin_sdk.jsonResponse)(res, { error: String(e) }, 500);
         }
       });
+      import_plugin_sdk.server.route("GET", "/cf-ddns/dnspod-lines", async (req, res) => {
+        if (!isAdmin(req)) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: "\u8BF7\u4EE5\u7BA1\u7406\u5458\u8EAB\u4EFD\u767B\u5F55" }, 401);
+          return;
+        }
+        const domain = normalizeDNSName(parseQuery(req).domain);
+        if (domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: "\u8BF7\u8F93\u5165\u5B8C\u6574\u7684 DNSPod \u89E3\u6790\u57DF\u540D" }, 400);
+          return;
+        }
+        try {
+          const config = await import_plugin_sdk.server.getConfig();
+          const lines = await listDNSPodLines(dnsPodCredentials(config), domain);
+          (0, import_plugin_sdk.jsonResponse)(res, { lines });
+        } catch (e) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: e instanceof Error ? e.message : String(e) }, 502);
+        }
+      });
       import_plugin_sdk.server.route("GET", "/cf-ddns/records", async (req, res) => {
         if (!isAdmin(req)) {
           res.statusCode = 401;
@@ -981,50 +1207,60 @@
         const oldRecs = loadRecords();
         const oldMap = /* @__PURE__ */ new Map();
         oldRecs.forEach(
-          (r) => oldMap.set(recordKey(r.record_name, r.record_type), r)
+          (r) => oldMap.set(recordKey(r), r)
         );
+        const clean = [];
+        const dnsPodKeys = /* @__PURE__ */ new Set();
         for (let i = 0; i < arr.length; i++) {
           const r = arr[i] || {};
           const name = String(r.record_name || "").trim();
-          if (!name) {
-            (0, import_plugin_sdk.jsonResponse)(res, { error: `\u7B2C ${i + 1} \u6761\u8BB0\u5F55\u7F3A\u5C11 record_name` }, 400);
-            return;
-          }
-          if (!name.includes(".")) {
-            (0, import_plugin_sdk.jsonResponse)(
-              res,
-              { error: `\u7B2C ${i + 1} \u6761\u8BB0\u5F55\u7684 record_name \u4E0D\u662F\u5408\u6CD5\u57DF\u540D\uFF1A${name}` },
-              400
-            );
+          try {
+            if (!name.includes(".")) throw new Error("\u8BB0\u5F55\u540D\u79F0\u5E94\u4E3A\u5B8C\u6574\u57DF\u540D\uFF08FQDN\uFF09");
+            if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod") {
+              throw new Error("\u672A\u77E5\u7684 DNS \u63D0\u4F9B\u5546");
+            }
+            const rec = {
+              record_name: name,
+              record_type: r.record_type === "AAAA" ? "AAAA" : "A",
+              source_node: Array.isArray(r.source_node) ? r.source_node.map(String) : [],
+              ttl: Number(r.ttl) || 1,
+              proxied: !!r.proxied,
+              comment: r.comment ? String(r.comment) : void 0
+            };
+            if (r.provider === "dnspod") {
+              const dns = normalizeDNSPodRecord({
+                ...rec,
+                provider: "dnspod",
+                domain: r.domain,
+                record_line: r.record_line,
+                record_line_name: typeof r.record_line_name === "string" ? r.record_line_name : void 0,
+                record_id: r.record_id,
+                weight: r.weight,
+                proxied: false,
+                ttl: r.ttl,
+                ttl_seconds: r.ttl_seconds
+              });
+              const key = recordKey(dns);
+              if (dnsPodKeys.has(key)) throw new Error("DNSPod \u8BB0\u5F55\u914D\u7F6E\u91CD\u590D");
+              if (dns.ttl_seconds === void 0) {
+                const old = oldMap.get(key);
+                dns.ttl_seconds = old ? configuredDNSPodTTL(old) : DNSPOD_DEFAULT_TTL;
+              }
+              dnsPodKeys.add(key);
+              clean.push(dns);
+            } else {
+              rec.zone_id = String(r.zone_id || "");
+              rec.api_token = r.api_token && r.api_token !== TOKEN_SET ? String(r.api_token) : oldMap.get(recordKey(rec))?.api_token;
+              clean.push(rec);
+            }
+          } catch (e) {
+            (0, import_plugin_sdk.jsonResponse)(res, { error: `\u7B2C ${i + 1} \u6761\u8BB0\u5F55\uFF1A${e.message}` }, 400);
             return;
           }
         }
-        const clean = arr.map((r) => {
-          const key = recordKey(String(r.record_name || ""), r.record_type === "AAAA" ? "AAAA" : "A");
-          let token;
-          if (r.api_token && String(r.api_token) !== TOKEN_SET) {
-            token = String(r.api_token);
-          } else if (String(r.api_token) === TOKEN_SET) {
-            const ex = oldMap.get(key);
-            token = ex ? ex.api_token : void 0;
-          } else {
-            const ex = oldMap.get(key);
-            token = ex ? ex.api_token : void 0;
-          }
-          return {
-            zone_id: String(r.zone_id || ""),
-            record_name: String(r.record_name || ""),
-            record_type: r.record_type === "AAAA" ? "AAAA" : "A",
-            source_node: Array.isArray(r.source_node) ? r.source_node.map((x) => String(x)) : [],
-            ttl: Number(r.ttl) || 60,
-            proxied: !!r.proxied,
-            comment: r.comment ? String(r.comment) : void 0,
-            api_token: token
-          };
-        });
         const oldKeys = new Set(oldMap.keys());
         const newKeys = new Set(
-          clean.map((r) => recordKey(r.record_name, r.record_type))
+          clean.map((r) => recordKey(r))
         );
         let added = 0;
         let removed = 0;
@@ -1035,9 +1271,15 @@
             if (String(a[k] ?? "") !== String(b[k] ?? "")) out.push(label);
           };
           cmp("zone_id", "Zone");
+          cmp("record_line", "\u7EBF\u8DEF");
+          cmp("weight", "\u6743\u91CD");
           cmp("record_name", "\u540D\u79F0");
           cmp("record_type", "\u7C7B\u578B");
-          cmp("ttl", "TTL");
+          if (b.provider === "dnspod") {
+            if (configuredDNSPodTTL(a) !== configuredDNSPodTTL(b)) out.push("TTL");
+          } else {
+            cmp("ttl", "TTL");
+          }
           cmp("proxied", "\u4EE3\u7406");
           cmp("comment", "\u5907\u6CE8");
           const sa = (a.source_node || []).join(",");
@@ -1047,7 +1289,7 @@
           return out;
         };
         clean.forEach((r) => {
-          const key = recordKey(r.record_name, r.record_type);
+          const key = recordKey(r);
           const old = oldMap.get(key);
           if (!old) {
             added++;
@@ -1066,7 +1308,7 @@
           }
         });
         oldRecs.forEach((r) => {
-          if (!newKeys.has(recordKey(r.record_name, r.record_type))) {
+          if (!newKeys.has(recordKey(r))) {
             removed++;
             logSync(r, "delete", true, `\u5220\u9664\u8BB0\u5F55 ${r.record_name} (${r.record_type})`);
           }

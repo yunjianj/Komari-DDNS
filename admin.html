@@ -22,6 +22,7 @@
       button.danger:hover { background: #fef2f2; }
       button:disabled { opacity: .6; cursor: default; }
       .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+      #listPanel { overflow-x: auto; }
       table { width: 100%; border-collapse: collapse; font-size: 14px; }
       thead th { text-align: left; padding: 12px 16px; color: #6b7280; font-weight: 600; border-bottom: 1px solid #e5e7eb; background: #f9fafb; }
       thead th:first-child { border-top-left-radius: 8px; }
@@ -58,6 +59,8 @@
       .field input::placeholder { color: #9ca3af; }
       .field select[multiple] { height: 90px; }
       .field small { color: #6b7280; font-size: 12px; font-weight: 400; }
+      .field small.line-error { color: #dc2626; }
+      #retryLines { align-self: flex-start; padding: 4px 8px; font-size: 12px; }
       .toggle { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
       .toggle input { display: none; }
       .switch { width: 40px; height: 22px; border-radius: 999px; background: #d1d5db; position: relative; transition: background .2s; }
@@ -89,7 +92,7 @@
   <body>
     <div class="container">
       <h2>Komari DDNS</h2>
-      <div class="sub">根据 Komari 节点上报的公网 IP 自动更新 Cloudflare DNS 记录</div>
+      <div class="sub">根据 Komari 节点上报的公网 IP 自动更新 Cloudflare 和腾讯云 DNSPod 解析记录</div>
 
       <div class="toolbar">
         <div class="left">
@@ -107,6 +110,35 @@
             <input type="text" id="fName" placeholder="home.example.com" />
           </div>
           <div class="field">
+            <label for="fProvider">DNS 提供商</label>
+            <select id="fProvider">
+              <option value="cloudflare">Cloudflare</option>
+              <option value="dnspod">腾讯云 DNSPod（中国站）</option>
+            </select>
+          </div>
+          <div class="field hidden" data-dnspod>
+            <label for="fDomain">DNSPod 解析域名</label>
+            <input type="text" id="fDomain" placeholder="example.com" />
+          </div>
+          <div class="field hidden" data-dnspod>
+            <label for="fLine">线路类型</label>
+            <select id="fLine" aria-describedby="lineStatus" disabled>
+              <option value="">请先填写解析域名</option>
+            </select>
+            <small id="lineStatus" role="status"></small>
+            <button type="button" id="retryLines" class="secondary hidden">重试加载</button>
+          </div>
+          <div class="field hidden" data-dnspod>
+            <label for="fWeight">权重</label>
+            <input type="number" id="fWeight" min="0" max="100" step="1" placeholder="留空保留现有权重" />
+            <small>填写 0 关闭权重，1–100 设置权重。</small>
+          </div>
+          <div class="field hidden" data-dnspod>
+            <label for="fRecordId">DNSPod 记录 ID</label>
+            <input type="number" id="fRecordId" min="1" step="1" placeholder="可选" />
+            <small>同名、同类型、同线路有多条记录时填写。</small>
+          </div>
+          <div class="field">
             <label>类型</label>
             <select id="fType">
               <option value="A">A</option>
@@ -117,7 +149,7 @@
             <label>来源节点 <small>（记录将使用此节点上报的公网 IP）</small></label>
             <select id="fSource"></select>
           </div>
-          <div class="field">
+          <div class="field" id="proxyField">
             <label>代理状态</label>
             <label class="toggle">
               <input type="checkbox" id="fProxied" />
@@ -128,8 +160,8 @@
               </span>
             </label>
           </div>
-          <div class="field">
-            <label>TTL</label>
+          <div class="field" id="cloudflareTtlField">
+            <label for="fTtl">TTL</label>
             <select id="fTtl">
               <option value="1" selected>自动</option>
               <option value="60">1 分钟</option>
@@ -144,6 +176,11 @@
               <option value="43200">12 小时</option>
               <option value="86400">1 天</option>
             </select>
+          </div>
+          <div class="field hidden" data-dnspod>
+            <label for="fDNSPodTtl">TTL（秒）</label>
+            <input type="number" id="fDNSPodTtl" min="1" max="604800" step="1" aria-describedby="dnspodTtlHelp" />
+            <small id="dnspodTtlHelp">最低值取决于套餐，例如免费版 600 秒、专业版 60 秒。</small>
           </div>
           <div class="field">
             <label>备注</label>
@@ -169,7 +206,8 @@
               <th>名称</th>
               <th>类型</th>
               <th>来源节点</th>
-              <th>代理状态</th>
+              <th>DNS 提供商</th>
+              <th>代理 / 线路与权重</th>
               <th>TTL</th>
               <th>内容</th>
               <th>备注</th>
@@ -211,11 +249,16 @@
       var NODES_URL = "/cf-ddns/nodes";
       var STATUS_URL = "/cf-ddns/status";
       var SYNC_URL = "/cf-ddns/sync";
+      var DNSPOD_LINES_URL = "/cf-ddns/dnspod-lines";
 
       var NODES = [];
       var records = [];
       var state = {};
       var editingIndex = -1;
+      var lineLookupDomain = "";
+      var lineLookupTimer;
+      var lineLookupVersion = 0;
+      var DNSPOD_DEFAULT_TTL = 600;
 
       var CLOUD_SVG = '<svg class="cloud" viewBox="0 0 24 24"><path d="M18.5 10.5c-.4 0-.7 0-1.1.1-.6-2.4-2.8-4.1-5.4-4.1-2.9 0-5.3 2.1-5.8 4.9-.3-.1-.7-.1-1-.1-2.5 0-4.5 2-4.5 4.5s2 4.5 4.5 4.5h13c2.5 0 4.5-2 4.5-4.5s-2-4.7-4.5-4.7z"/></svg>';
 
@@ -234,6 +277,7 @@
         86400: "1 天"
       };
       function ttlText(v){ var n = Number(v); return TTL_LABELS[n] || (n ? n + " 秒" : "—"); }
+      function configuredDNSPodTTL(rec){ return rec.ttl_seconds ?? (rec.ttl === 1 ? undefined : rec.ttl); }
 
       function el(tag, cls, text){
         var e = document.createElement(tag);
@@ -243,7 +287,12 @@
       }
       function fmt(ts){ if(!ts) return "—"; try { return new Date(ts).toLocaleString(); } catch(e){ return ts; } }
       function msg(text, cls){ var m = document.getElementById("msg"); m.textContent = text || ""; m.className = "msg " + (cls||""); }
-      function recordKey(name, type){ return name + "#" + type; }
+      function recordKey(rec){
+        if(rec.provider !== "dnspod") return rec.record_name + "#" + rec.record_type;
+        var target = rec.record_id ? "id:" + rec.record_id : "line:" + (rec.record_line || "默认");
+        return ["dnspod:" + rec.domain, rec.record_name, rec.record_type, target].join("#");
+      }
+      function dnsName(value){ return value.trim().toLowerCase().replace(/\.$/, ""); }
       function nodeName(uuid){ var n = NODES.find(function(x){ return x.uuid === uuid; }); return n ? n.name : uuid.slice(0,8); }
 
       async function loadNodes(){
@@ -276,14 +325,26 @@
         empty.classList.add("hidden");
         records.forEach(function(rec, i){
           var tr = el("tr");
-          var key = recordKey(rec.record_name, rec.record_type);
+          var key = recordKey(rec);
           var st = state[key] || {};
 
           var tdName = el("td"); tdName.appendChild(el("span", "mono name", rec.record_name)); tr.appendChild(tdName);
           var tdType = el("td"); tdType.appendChild(el("span", "type", rec.record_type)); tr.appendChild(tdType);
           var tdSource = el("td"); tdSource.appendChild(sourceNodeText(rec.source_node)); tr.appendChild(tdSource);
-          var tdProxy = el("td"); tdProxy.appendChild(proxiedTag(rec.proxied)); tr.appendChild(tdProxy);
-          var tdTtl = el("td"); tdTtl.textContent = ttlText(rec.ttl || 1); tr.appendChild(tdTtl);
+          var isDNSPod = rec.provider === "dnspod";
+          tr.appendChild(el("td", "", isDNSPod ? "腾讯云 DNSPod" : "Cloudflare"));
+          var tdOptions = el("td");
+          if(isDNSPod){
+            var weight = rec.weight === undefined ? "权重未设置" : rec.weight === 0 ? "权重关闭" : "权重 " + rec.weight;
+            var id = rec.record_id ? " · ID " + rec.record_id : "";
+            tdOptions.textContent = (rec.record_line_name || rec.record_line || "默认") + " · " + weight + id;
+          } else {
+            tdOptions.appendChild(proxiedTag(rec.proxied));
+          }
+          tr.appendChild(tdOptions);
+          var ttl = isDNSPod ? configuredDNSPodTTL(rec) : rec.ttl || 1;
+          var ttlLabel = isDNSPod ? (ttl === undefined ? "沿用现有 TTL" : ttl + " 秒") : ttlText(ttl);
+          tr.appendChild(el("td", "", ttlLabel));
           var tdContent = el("td"); tdContent.appendChild(el("span", st.last_ip ? "mono ip" : "empty-cell", st.last_ip || "—")); tr.appendChild(tdContent);
           var tdComment = el("td"); tdComment.textContent = rec.comment || "—"; tdComment.style.color = rec.comment ? "#374151" : "#9ca3af"; tr.appendChild(tdComment);
 
@@ -292,7 +353,7 @@
           var editBtn = el("button", "edit-btn", "编辑");
           editBtn.onclick = function(){ startEdit(i); };
           var delBtn = el("button", "delete-btn", "删除");
-          delBtn.onclick = function(){ if(confirm("确定删除这条记录？")){ records.splice(i,1); saveRecords(); } };
+          delBtn.onclick = function(){ if(confirm("确定删除这条记录？")){ saveRecords(records.filter(function(_, index){ return index !== i; })); } };
           wrap.appendChild(editBtn); wrap.appendChild(delBtn);
           tdAct.appendChild(wrap);
           tr.appendChild(tdAct);
@@ -317,7 +378,27 @@
         document.getElementById("editTitle").textContent = isNew ? "添加记录" : "编辑记录";
         document.getElementById("fName").value = rec.record_name || "";
         document.getElementById("fType").value = rec.record_type || "A";
-        document.getElementById("fTtl").value = String(rec.ttl || 1);
+        document.getElementById("fProvider").value = rec.provider || "cloudflare";
+        document.getElementById("fDomain").value = rec.domain || "";
+        document.getElementById("fWeight").value = rec.weight ?? "";
+        document.getElementById("fRecordId").value = rec.record_id ?? "";
+        var ttlSelect = document.getElementById("fTtl");
+        var customTtl = ttlSelect.querySelector("[data-custom]");
+        if(customTtl) customTtl.remove();
+        var ttl = rec.ttl || 1;
+        if(!TTL_LABELS[ttl]){
+          customTtl = el("option", "", ttlText(ttl));
+          customTtl.value = String(ttl);
+          customTtl.dataset.custom = "";
+          ttlSelect.appendChild(customTtl);
+        }
+        ttlSelect.value = String(ttl);
+        var dnsPodTtl = document.getElementById("fDNSPodTtl");
+        var dnsPodSeconds = rec.provider === "dnspod" ? configuredDNSPodTTL(rec) : DNSPOD_DEFAULT_TTL;
+        dnsPodTtl.value = dnsPodSeconds ?? "";
+        dnsPodTtl.placeholder = dnsPodSeconds === undefined ? "留空保留现有记录的 TTL" : "";
+        updateProviderFields();
+        scheduleDNSPodLines(0);
         document.getElementById("fComment").value = rec.comment || "";
         document.getElementById("fProxied").checked = !!rec.proxied;
         updateProxyText();
@@ -330,9 +411,94 @@
       }
 
       function closeEdit(){
+        cancelLineLookup();
         document.getElementById("editPanel").classList.add("hidden");
         document.getElementById("listPanel").classList.remove("hidden");
         editingIndex = -1;
+      }
+
+      function updateProviderFields(){
+        var isDNSPod = document.getElementById("fProvider").value === "dnspod";
+        document.getElementById("proxyField").classList.toggle("hidden", isDNSPod);
+        document.getElementById("cloudflareTtlField").classList.toggle("hidden", isDNSPod);
+        document.querySelectorAll("[data-dnspod]").forEach(function(field){
+          field.classList.toggle("hidden", !isDNSPod);
+        });
+      }
+
+      function cancelLineLookup(){
+        clearTimeout(lineLookupTimer);
+        lineLookupVersion++;
+        lineLookupDomain = "";
+      }
+
+      function setLinePlaceholder(text){
+        var select = document.getElementById("fLine");
+        var placeholder = el("option", "", text);
+        placeholder.value = "";
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        select.replaceChildren(placeholder);
+        select.disabled = true;
+        return select;
+      }
+
+      function scheduleDNSPodLines(delay){
+        cancelLineLookup();
+        var status = document.getElementById("lineStatus");
+        status.textContent = "";
+        status.classList.remove("line-error");
+        document.getElementById("retryLines").classList.add("hidden");
+        setLinePlaceholder("请先填写解析域名");
+        if(document.getElementById("fProvider").value !== "dnspod") return;
+        var domain = dnsName(document.getElementById("fDomain").value);
+        lineLookupDomain = domain;
+        if(domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) return;
+        setLinePlaceholder("正在加载可用线路…");
+        var version = lineLookupVersion;
+        lineLookupTimer = setTimeout(function(){ loadDNSPodLines(domain, version); }, delay);
+      }
+
+      async function loadDNSPodLines(domain, version){
+        var status = document.getElementById("lineStatus");
+        try {
+          var response = await fetch(DNSPOD_LINES_URL + "?domain=" + encodeURIComponent(domain), { credentials: "same-origin" });
+          var data = await response.json();
+          if(version !== lineLookupVersion) return;
+          if(!response.ok || !Array.isArray(data.lines)) throw new Error(data.error || "DNSPod 线路查询失败");
+          if(!data.lines.length){
+            setLinePlaceholder("该域名暂无可用线路");
+            return;
+          }
+
+          var previous = records[editingIndex];
+          var savedLine = previous && previous.provider === "dnspod" && dnsName(previous.domain || "") === domain
+            ? previous.record_line || "默认" : "";
+          var selected = data.lines.find(function(line){ return line.id === savedLine || line.value === savedLine; });
+          if(savedLine && !selected) selected = data.lines.find(function(line){ return line.name === savedLine; });
+          if(!savedLine) selected = data.lines.find(function(line){ return line.value === "默认"; });
+
+          var select = setLinePlaceholder("请选择线路");
+          data.lines.forEach(function(line){
+            var option = el("option", "", line.name);
+            // Keep the stored spelling of legacy lines when editing other fields.
+            option.value = line === selected && savedLine ? savedLine : line.value;
+            option.dataset.lineName = line.name;
+            option.selected = line === selected;
+            select.appendChild(option);
+          });
+          select.disabled = false;
+          if(savedLine && !selected){
+            status.textContent = "原线路（" + (previous.record_line_name || savedLine) + "）当前不可用，请重新选择。";
+            status.classList.add("line-error");
+          }
+        } catch(e){
+          if(version !== lineLookupVersion) return;
+          setLinePlaceholder("线路加载失败");
+          status.textContent = e.message;
+          status.classList.add("line-error");
+          document.getElementById("retryLines").classList.remove("hidden");
+        }
       }
 
       function updateProxyText(){
@@ -344,17 +510,29 @@
         if(!rec.record_name){ return "请输入记录名称"; }
         if(!rec.record_name.includes(".")){ return "记录名称应为完整域名（FQDN）"; }
         if(!rec.source_node || rec.source_node.length === 0){ return "请至少选择一个来源节点"; }
+        if(rec.provider === "dnspod"){
+          if(!rec.domain.includes(".") || (rec.record_name !== rec.domain && !rec.record_name.endsWith("." + rec.domain))){
+            return "解析域名必须是记录名称本身或其上级域名";
+          }
+          if(rec.weight !== undefined && (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > 100)){
+            return "权重必须是 0 到 100 的整数，或留空";
+          }
+          if(rec.record_id !== undefined && (!Number.isSafeInteger(rec.record_id) || rec.record_id < 1)){
+            return "DNSPod 记录 ID 必须是正整数，或留空";
+          }
+        }
         return null;
       }
 
-      async function saveRecords(){
+      async function saveRecords(next){
         msg("保存中…");
         try {
-          var r = await fetch(RECORDS_URL, { method:"PUT", credentials:"same-origin", headers:{"Content-Type":"application/json"}, body: JSON.stringify(records) });
+          var r = await fetch(RECORDS_URL, { method:"PUT", credentials:"same-origin", headers:{"Content-Type":"application/json"}, body: JSON.stringify(next) });
           if(r.status === 401){ msg("未授权（请以管理员身份登录）", "err"); return; }
           var d = await r.json();
           if(d.error){ msg("保存失败: "+d.error, "err"); }
           else {
+            records = next;
             var parts = ["记录已保存"];
             if((d.added||0) > 0) parts.push("新增 "+d.added+" 条");
             if((d.edited||0) > 0) parts.push("修改 "+d.edited+" 条");
@@ -368,28 +546,75 @@
       document.getElementById("add").onclick = function(){ startEdit(-1); };
       document.getElementById("cancel").onclick = closeEdit;
       document.getElementById("fProxied").onchange = updateProxyText;
+      document.getElementById("fProvider").onchange = function(){
+        updateProviderFields();
+        if(this.value === "dnspod" && lineLookupDomain !== dnsName(document.getElementById("fDomain").value)){
+          scheduleDNSPodLines(0);
+        }
+      };
+      document.getElementById("fDomain").oninput = function(){
+        if(lineLookupDomain !== dnsName(this.value)) scheduleDNSPodLines(350);
+      };
+      document.getElementById("fLine").onchange = function(){
+        var status = document.getElementById("lineStatus");
+        status.textContent = "";
+        status.classList.remove("line-error");
+      };
+      document.getElementById("retryLines").onclick = function(){ scheduleDNSPodLines(0); };
 
       document.getElementById("save").onclick = function(){
         var rec = {
           record_name: document.getElementById("fName").value.trim(),
           record_type: document.getElementById("fType").value,
           source_node: Array.from(document.getElementById("fSource").selectedOptions).map(function(o){ return o.value; }),
-          ttl: Number(document.getElementById("fTtl").value) || 1,
           proxied: document.getElementById("fProxied").checked,
           comment: document.getElementById("fComment").value.trim() || undefined,
         };
+        var existing = records[editingIndex];
+        if(document.getElementById("fProvider").value === "dnspod"){
+          rec.provider = "dnspod";
+          rec.domain = dnsName(document.getElementById("fDomain").value);
+          rec.record_name = dnsName(rec.record_name);
+          var line = document.getElementById("fLine");
+          if(line.disabled || !line.value || rec.domain !== lineLookupDomain){
+            msg("请填写解析域名并选择可用线路", "err");
+            return;
+          }
+          rec.record_line = line.value === "0" ? "默认" : line.value;
+          rec.record_line_name = line.selectedOptions[0].dataset.lineName;
+          rec.proxied = false;
+          var weight = document.getElementById("fWeight");
+          var recordId = document.getElementById("fRecordId");
+          if(!weight.checkValidity() || !recordId.checkValidity()){
+            msg("请填写有效的权重和 DNSPod 记录 ID", "err");
+            return;
+          }
+          if(weight.value !== "") rec.weight = Number(weight.value);
+          if(recordId.value !== "") rec.record_id = Number(recordId.value);
+          var ttl = document.getElementById("fDNSPodTtl");
+          var keepExistingTtl = existing && existing.provider === "dnspod" &&
+            configuredDNSPodTTL(existing) === undefined && recordKey(existing) === recordKey(rec);
+          if(!ttl.checkValidity() || (ttl.value === "" && !keepExistingTtl)){
+            msg("请输入 1 到 604800 秒的整数 TTL", "err");
+            return;
+          }
+          if(ttl.value !== "") rec.ttl_seconds = Number(ttl.value);
+        } else {
+          rec.ttl = Number(document.getElementById("fTtl").value) || 1;
+          if(existing && existing.provider !== "dnspod") rec.zone_id = existing.zone_id;
+        }
         var err = validate(rec);
         if(err){ msg(err, "err"); return; }
-        if(editingIndex >= 0){ records[editingIndex] = rec; }
-        else { records.push(rec); }
-        saveRecords();
+        var next = records.slice();
+        if(editingIndex >= 0){ next[editingIndex] = rec; }
+        else { next.push(rec); }
+        saveRecords(next);
       };
 
       document.getElementById("delEdit").onclick = function(){
         if(editingIndex < 0) return;
         if(!confirm("确定删除这条记录？")) return;
-        records.splice(editingIndex, 1);
-        saveRecords();
+        saveRecords(records.filter(function(_, index){ return index !== editingIndex; }));
       };
 
       document.getElementById("sync").onclick = async function(){
@@ -415,6 +640,7 @@
       function actLabel(a){ return ({ create:"创建", update:"更新", skip:"跳过", error:"错误", sync:"同步", delete:"删除", add:"新增", edit:"修改" })[a] || a; }
 
       function switchTab(which){
+        cancelLineLookup();
         var isLog = which === "logs";
         document.getElementById("tabRecords").classList.toggle("active", !isLog);
         document.getElementById("tabLogs").classList.toggle("active", isLog);
@@ -491,6 +717,9 @@
           var tr = el("tr");
           var tdTime = el("td"); tdTime.textContent = fmt(l.time); tr.appendChild(tdTime);
           var tdName = el("td"); tdName.appendChild(el("span", "mono name", l.record_name || "—")); tr.appendChild(tdName);
+          if(l.provider === "dnspod"){
+            tdName.appendChild(el("div", "hint", "DNSPod · " + (l.record_line || "默认") + (l.record_id ? " · ID " + l.record_id : "")));
+          }
           var tdType = el("td"); tdType.appendChild(el("span", "type", l.record_type || "")); tr.appendChild(tdType);
           var tdAct = el("td"); tdAct.appendChild(el("span", "act " + l.action, actLabel(l.action))); tr.appendChild(tdAct);
           var tdDetail = el("td"); tdDetail.className = l.action === "error" ? "detail-err" : ""; tdDetail.textContent = l.detail || ""; tr.appendChild(tdDetail);

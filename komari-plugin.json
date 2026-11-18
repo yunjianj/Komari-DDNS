@@ -6,18 +6,18 @@
   },
   "short": "cf-ddns",
   "description": {
-    "zh_CN": "根据 Komari 节点上报的公网 IP，自动更新 Cloudflare DNS 解析记录，实现动态域名解析。",
-    "en": "Automatically update Cloudflare DNS records from the public IP reported by a Komari node, providing dynamic DNS."
+    "zh_CN": "根据 Komari 节点上报的公网 IP，自动更新 Cloudflare 和腾讯云 DNSPod 解析记录，实现动态域名解析。",
+    "en": "Automatically update Cloudflare and Tencent Cloud DNSPod records from the public IP reported by a Komari node, providing dynamic DNS."
   },
   "author": "穿云箭",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "komari": ">=1.4.0",
   "entry": "script.js",
   "permissions": {
     "node": true,
     "allowSystemRPC": true,
     "allowRoutes": true,
-    "maxHTTPBodyBytes": 65536,
+    "maxHTTPBodyBytes": 4194304,
     "timeout": 30
   },
   "configuration": {
@@ -27,11 +27,20 @@
         "key": "api_token",
         "name": { "zh_CN": "Cloudflare API Token", "en": "Cloudflare API Token" },
         "type": "string",
-        "required": true,
         "help": {
-          "zh_CN": "需具备 Zone:DNS:Edit 权限的全局 Cloudflare API Token，所有记录共用该 Token",
-          "en": "Global Cloudflare API Token with Zone:DNS:Edit permission, shared by all records."
+          "zh_CN": "Cloudflare 记录使用的 API Token，需具备 Zone:DNS:Edit 权限。",
+          "en": "API token for Cloudflare records. Requires Zone:DNS:Edit permission."
         }
+      },
+      {
+        "key": "tencent_secret_id",
+        "name": { "zh_CN": "腾讯云 SecretId", "en": "Tencent Cloud SecretId" },
+        "type": "string"
+      },
+      {
+        "key": "tencent_secret_key",
+        "name": { "zh_CN": "腾讯云 SecretKey", "en": "Tencent Cloud SecretKey" },
+        "type": "string"
       },
       {
         "key": "interval",

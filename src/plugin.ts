@@ -1,23 +1,34 @@
 import { definePlugin, server, jsonResponse } from "@komari-monitor/plugin-sdk";
 
+import { DNSPOD_DEFAULT_TTL, listDNSPodLines, syncDNSPodRecord } from "./dnspod";
+
 // Host modules (available when permissions.node is enabled). Kept as dynamic
 // require so the bundler leaves them external and the runtime resolves them.
 const fs = require("fs");
 const path = require("path");
 
 interface PluginConfig {
-  api_token: string;
+  api_token?: string;
+  tencent_secret_id?: string;
+  tencent_secret_key?: string;
   interval: number;
   notify: boolean;
   records?: string; // legacy JSON textbox, only used for one-time seeding
 }
 
 interface RecordConfig {
+  provider?: "dnspod";
+  domain?: string;
+  record_line?: string;
+  record_line_name?: string;
+  record_id?: number;
+  weight?: number;
   zone_id?: string;
   record_name: string;
   record_type: "A" | "AAAA";
   source_node: string[];
-  ttl: number;
+  ttl?: number;
+  ttl_seconds?: number;
   proxied: boolean;
   comment?: string;
   api_token?: string;
@@ -26,6 +37,7 @@ interface RecordConfig {
 interface SyncContext {
   nodes: Record<string, any>;
   statuses: Record<string, any>;
+  claimedDNSPodRecords: Set<string>;
 }
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -123,8 +135,49 @@ function getRecords(config: PluginConfig): RecordConfig[] {
   return stored;
 }
 
-function recordKey(name: string, type: string): string {
-  return `${name}#${type}`;
+function recordKey(rec: RecordConfig): string {
+  if (rec.provider !== "dnspod") return `${rec.record_name}#${rec.record_type}`;
+  const target = rec.record_id ? `id:${rec.record_id}` : `line:${rec.record_line || "默认"}`;
+  return `dnspod:${rec.domain}#${rec.record_name}#${rec.record_type}#${target}`;
+}
+
+function normalizeDNSName(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase().replace(/\.$/, "");
+}
+
+function dnsPodCredentials(config: PluginConfig) {
+  const secretId = String(config.tencent_secret_id ?? "").trim();
+  const secretKey = String(config.tencent_secret_key ?? "").trim();
+  if (!secretId || !secretKey) throw new Error("请在插件配置中填写腾讯云 SecretId 和 SecretKey");
+  return { secretId, secretKey };
+}
+
+function configuredDNSPodTTL(rec: RecordConfig): number | undefined {
+  // The old shared TTL field used 1 as an automatic sentinel. The new
+  // DNSPod field can represent an explicit one-second TTL.
+  return rec.ttl_seconds !== undefined ? rec.ttl_seconds : rec.ttl === 1 ? undefined : rec.ttl;
+}
+
+function normalizeDNSPodRecord(rec: RecordConfig): RecordConfig {
+  const domain = normalizeDNSName(rec.domain);
+  const name = normalizeDNSName(rec.record_name);
+  if (!domain.includes(".") || (name !== domain && !name.endsWith("." + domain))) {
+    throw new Error("解析域名必须是记录名称本身或其上级域名");
+  }
+  if (rec.weight !== undefined &&
+      (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > 100)) {
+    throw new Error("权重必须是 0 到 100 的整数，或留空");
+  }
+  if (rec.record_id !== undefined &&
+      (!Number.isSafeInteger(rec.record_id) || rec.record_id < 1)) {
+    throw new Error("DNSPod 记录 ID 必须是正整数，或留空");
+  }
+  const ttl = configuredDNSPodTTL(rec);
+  if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 1 || ttl > 604800)) {
+    throw new Error("DNSPod TTL 必须为 1 到 604800 秒的整数");
+  }
+  const line = String(rec.record_line ?? "").trim();
+  return { ...rec, domain, record_name: name, record_line: !line || line === "0" ? "默认" : line, ttl: undefined, ttl_seconds: ttl };
 }
 
 // Parse the legacy `records` textbox (a JSON array of record objects).
@@ -324,6 +377,9 @@ function logSync(
     time: new Date().toISOString(),
     record_name: rec.record_name,
     record_type: rec.record_type,
+    provider: rec.provider,
+    record_line: rec.record_line,
+    record_id: rec.record_id,
     action,
     success,
     detail,
@@ -333,10 +389,10 @@ function logSync(
 
 async function syncRecord(
   config: PluginConfig,
-  rec: any,
+  rec: RecordConfig,
   ctx: SyncContext,
 ): Promise<Record<string, any>> {
-  const key = recordKey(rec.record_name, rec.record_type);
+  const key = recordKey(rec);
   const result: Record<string, any> = {
     key,
     record_name: rec.record_name,
@@ -344,150 +400,112 @@ async function syncRecord(
     zone_id: rec.zone_id,
   };
 
-  const token = rec.api_token || config.api_token;
-  const sourceNode =
-    rec.source_node && rec.source_node.length ? rec.source_node : [];
-
-  if (
-    !token ||
-    !rec.record_name ||
-    !sourceNode ||
-    sourceNode.length === 0
-  ) {
-    result.error = "配置不完整（缺少 token / record_name / 来源节点）";
-    logSync(rec, "error", false, result.error);
-    return result;
-  }
-
-  const target = await resolveTargetIp(ctx, sourceNode, rec.record_type);
-  if (!target) {
-    result.skipped = "no valid node IP";
-    logSync(rec, "skip", true, "无可用节点公网 IP");
-    return result;
-  }
-  console.log(
-    `[cf-ddns] [${rec.record_name}] resolved target: ${target.name} -> ${target.ip}`,
-  );
-
-  // Resolve the zone: use the explicitly configured zone_id, otherwise
-  // auto-discover it from the record name via the Cloudflare API.
-  let zoneId = rec.zone_id;
-  if (!zoneId) {
-    try {
-      const zones = await getZones(token);
-      const z = zoneForRecord(zones, rec.record_name);
-      if (!z) {
-        result.error =
-          "无法自动解析 Zone ID（记录名 " +
-          rec.record_name +
-          " 在 Cloudflare 账号下找不到对应域名，可在记录中手动填写 zone_id 覆盖）";
-        logSync(rec, "error", false, result.error);
-        return result;
-      }
-      zoneId = z.id;
-      console.log(
-        `[cf-ddns] [${rec.record_name}] auto-resolved zone ${z.name} (${zoneId})`,
-      );
-    } catch (e) {
-      result.error = String(e);
-      logSync(rec, "error", false, result.error);
+  try {
+    if (!rec.record_name || !rec.source_node?.length) {
+      throw new Error("配置不完整（缺少记录名称或来源节点）");
+    }
+    const target = await resolveTargetIp(ctx, rec.source_node, rec.record_type);
+    if (!target) {
+      result.skipped = "no valid node IP";
+      logSync(rec, "skip", true, "无可用节点公网 IP");
       return result;
     }
-  }
 
-  let record: any = null;
-  try {
-    record = await cloudflareList(
-      token,
-      zoneId,
-      rec.record_name,
-      rec.record_type,
-    );
+    const previous = loadState()[key] || {};
+    let createdId: number | undefined;
+    let action: "create" | "update" | "skip";
+    let skipDetail: string;
+    if (rec.provider === "dnspod") {
+      const dns = normalizeDNSPodRecord(rec);
+      const domain = dns.domain!;
+      const synced = await syncDNSPodRecord(
+        dnsPodCredentials(config),
+        {
+          domain,
+          subdomain: dns.record_name === domain ? "@" : dns.record_name.slice(0, -(domain.length + 1)),
+          type: dns.record_type,
+          line: dns.record_line!,
+          recordId: dns.record_id,
+          weight: dns.weight,
+          ttl: dns.ttl_seconds,
+        },
+        target.ip,
+        ctx.claimedDNSPodRecords,
+        Date.now() - previous.dnspod_created_at < 30_000 ? previous.dnspod_created_id : undefined,
+      );
+      action = synced.action;
+      if (action === "create") createdId = synced.id;
+      skipDetail = "DNSPod 解析记录已符合配置";
+    } else {
+      const token = rec.api_token || config.api_token;
+      if (!token) throw new Error("请配置 Cloudflare API Token");
+      action = await syncCloudflareRecord(token, rec, target.ip);
+      skipDetail = "IP 与代理状态均无变化";
+    }
+
+    result.current_ip = target.ip;
+    if (action === "skip") {
+      result.updated = false;
+      result.skipped = "no change";
+      logSync(rec, "skip", true, skipDetail);
+    } else {
+      const verb = action === "create" ? "创建" : "更新";
+      result[action === "create" ? "created" : "updated"] = true;
+      logSync(rec, action, true, `${verb} DNS 记录 → ${target.ip}`, target.ip);
+    }
+
+    const now = new Date().toISOString();
+    const state = loadState();
+    state[key] = {
+      record_name: rec.record_name,
+      record_type: rec.record_type,
+      last_ip: target.ip,
+      last_node: target.name,
+      last_checked_at: now,
+      last_update_at: action === "skip" ? previous.last_update_at : now,
+      dnspod_created_id: createdId ?? previous.dnspod_created_id,
+      dnspod_created_at: createdId === undefined ? previous.dnspod_created_at : Date.now(),
+    };
+    saveState(state);
+    if (action !== "skip" && config.notify) {
+      await sendNotify(config, rec, target, action === "create" ? "创建" : "更新");
+    }
   } catch (e) {
     result.error = String(e);
     logSync(rec, "error", false, result.error);
-    return result;
+  }
+  return result;
+}
+
+async function syncCloudflareRecord(
+  token: string,
+  rec: RecordConfig,
+  ip: string,
+): Promise<"create" | "update" | "skip"> {
+  let zoneId = rec.zone_id;
+  if (!zoneId) {
+    const zone = zoneForRecord(await getZones(token), rec.record_name);
+    if (!zone) {
+      throw new Error(`无法自动解析 Zone ID（记录名 ${rec.record_name} 在 Cloudflare 账号下找不到对应域名，可在记录中手动填写 zone_id 覆盖）`);
+    }
+    zoneId = zone.id as string;
   }
 
+  const record = await cloudflareList(token, zoneId, rec.record_name, rec.record_type);
   const payload = {
     type: rec.record_type,
     name: rec.record_name,
-    content: target.ip,
+    content: ip,
     ttl: rec.ttl || 1,
     proxied: !!rec.proxied,
   };
-
-  const st = loadState();
-  const prev = st[key] || {};
-
   if (!record) {
-    try {
-      record = await cloudflareCreate(token, zoneId, payload);
-    } catch (e) {
-      result.error = String(e);
-      logSync(rec, "error", false, result.error);
-      return result;
-    }
-    console.log(
-      `[cf-ddns] [${rec.record_name}] created -> ${target.ip} (id ${record.id})`,
-    );
-    result.created = true;
-    result.current_ip = target.ip;
-    logSync(rec, "create", true, `创建 DNS 记录 → ${target.ip}`, target.ip);
-  } else {
-    const wantProxied = !!rec.proxied;
-    const ipChanged = record.content !== target.ip;
-    const proxiedChanged = record.proxied !== wantProxied;
-    if (!ipChanged && !proxiedChanged) {
-      console.log(
-        `[cf-ddns] [${rec.record_name}] already points to ${target.ip} (proxied=${wantProxied}), no change`,
-      );
-      result.updated = false;
-      result.skipped = "no change";
-      result.current_ip = target.ip;
-      logSync(rec, "skip", true, "IP 与代理状态均无变化");
-    } else {
-      try {
-        await cloudflareUpdate(token, zoneId, record.id, payload);
-        console.log(
-          `[cf-ddns] [${rec.record_name}] updated -> ${target.ip} (proxied=${wantProxied})`,
-        );
-        result.updated = true;
-        result.current_ip = target.ip;
-        logSync(
-          rec,
-          "update",
-          true,
-          `更新 DNS 记录 → ${target.ip}${
-            proxiedChanged ? "（代理状态变更）" : ""
-          }`,
-          target.ip,
-        );
-      } catch (e) {
-        result.error = String(e);
-        logSync(rec, "error", false, result.error);
-        return result;
-      }
-    }
+    await cloudflareCreate(token, zoneId, payload);
+    return "create";
   }
-
-  st[key] = {
-    record_name: rec.record_name,
-    record_type: rec.record_type,
-    last_ip: target.ip,
-    last_node: target.name,
-    last_checked_at: new Date().toISOString(),
-    last_update_at:
-      result.updated || result.created
-        ? new Date().toISOString()
-        : prev.last_update_at,
-  };
-  saveState(st);
-
-  if ((result.updated || result.created) && config.notify) {
-    await sendNotify(config, rec, target, result.created ? "创建" : "更新");
-  }
-  return result;
+  if (record.content === ip && record.proxied === payload.proxied) return "skip";
+  await cloudflareUpdate(token, zoneId, record.id, payload);
+  return "update";
 }
 
 // Send a well-formed notification so the title, event type and associated
@@ -504,7 +522,7 @@ async function sendNotify(
       event: {
         event: "DDNS",
         emoji: "🌐",
-        message: `DDNS ${verb}：${rec.record_name} → ${target.ip}（节点 ${target.name}）`,
+        message: `DDNS ${verb}：${rec.record_name}${rec.provider === "dnspod" ? ` [${rec.record_line || "默认"}]` : ""} → ${target.ip}（节点 ${target.name}）`,
         time: new Date().toISOString(),
         clients: [{ uuid: target.uuid }],
       },
@@ -514,7 +532,17 @@ async function sendNotify(
   }
 }
 
-async function syncOnce(): Promise<Record<string, any>> {
+// Manual and scheduled syncs share a run to avoid concurrent DNS writes.
+let activeSync: Promise<Record<string, any>> | undefined;
+
+function syncOnce(): Promise<Record<string, any>> {
+  if (!activeSync) {
+    activeSync = syncAllRecords().finally(() => { activeSync = undefined; });
+  }
+  return activeSync;
+}
+
+async function syncAllRecords(): Promise<Record<string, any>> {
   const config = (await server.getConfig()) as unknown as PluginConfig;
   const list = getRecords(config);
   if (list.length === 0) {
@@ -540,14 +568,14 @@ async function syncOnce(): Promise<Record<string, any>> {
     );
   }
 
-  const ctx: SyncContext = { nodes, statuses };
+  const ctx: SyncContext = { nodes, statuses, claimedDNSPodRecords: new Set() };
   const results: Record<string, any>[] = [];
   for (const r of list) {
     try {
       results.push(await syncRecord(config, r, ctx));
     } catch (e: any) {
       results.push({
-        key: recordKey(r.record_name, r.record_type),
+        key: recordKey(r),
         record_name: r.record_name,
         record_type: r.record_type,
         error: String(e),
@@ -672,6 +700,25 @@ definePlugin({
       }
     });
 
+    server.route("GET", "/cf-ddns/dnspod-lines", async (req: any, res: any) => {
+      if (!isAdmin(req)) {
+        jsonResponse(res, { error: "请以管理员身份登录" }, 401);
+        return;
+      }
+      const domain = normalizeDNSName(parseQuery(req).domain);
+      if (domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) {
+        jsonResponse(res, { error: "请输入完整的 DNSPod 解析域名" }, 400);
+        return;
+      }
+      try {
+        const config = (await server.getConfig()) as unknown as PluginConfig;
+        const lines = await listDNSPodLines(dnsPodCredentials(config), domain);
+        jsonResponse(res, { lines });
+      } catch (e) {
+        jsonResponse(res, { error: e instanceof Error ? e.message : String(e) }, 502);
+      }
+    });
+
     // Read the current record list (managed in plugin storage).
     server.route("GET", "/cf-ddns/records", async (req: any, res: any) => {
       if (!isAdmin(req)) {
@@ -707,60 +754,65 @@ definePlugin({
       const oldRecs = loadRecords();
       const oldMap = new Map<string, any>();
       oldRecs.forEach((r: any) =>
-        oldMap.set(recordKey(r.record_name, r.record_type), r),
+        oldMap.set(recordKey(r), r),
       );
 
-      // Validate every record server-side; never trust the client.
+      const clean: RecordConfig[] = [];
+      const dnsPodKeys = new Set<string>();
       for (let i = 0; i < arr.length; i++) {
         const r = arr[i] || {};
         const name = String(r.record_name || "").trim();
-        if (!name) {
-          jsonResponse(res, { error: `第 ${i + 1} 条记录缺少 record_name` }, 400);
-          return;
-        }
-        if (!name.includes(".")) {
-          jsonResponse(
-            res,
-            { error: `第 ${i + 1} 条记录的 record_name 不是合法域名：${name}` },
-            400,
-          );
+        try {
+          if (!name.includes(".")) throw new Error("记录名称应为完整域名（FQDN）");
+          if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod") {
+            throw new Error("未知的 DNS 提供商");
+          }
+          const rec: RecordConfig = {
+            record_name: name,
+            record_type: r.record_type === "AAAA" ? "AAAA" : "A",
+            source_node: Array.isArray(r.source_node) ? r.source_node.map(String) : [],
+            ttl: Number(r.ttl) || 1,
+            proxied: !!r.proxied,
+            comment: r.comment ? String(r.comment) : undefined,
+          };
+          if (r.provider === "dnspod") {
+            const dns = normalizeDNSPodRecord({
+              ...rec,
+              provider: "dnspod",
+              domain: r.domain,
+              record_line: r.record_line,
+              record_line_name: typeof r.record_line_name === "string" ? r.record_line_name : undefined,
+              record_id: r.record_id,
+              weight: r.weight,
+              proxied: false,
+              ttl: r.ttl,
+              ttl_seconds: r.ttl_seconds,
+            });
+            const key = recordKey(dns);
+            if (dnsPodKeys.has(key)) throw new Error("DNSPod 记录配置重复");
+            if (dns.ttl_seconds === undefined) {
+              const old = oldMap.get(key);
+              dns.ttl_seconds = old ? configuredDNSPodTTL(old) : DNSPOD_DEFAULT_TTL;
+            }
+            dnsPodKeys.add(key);
+            clean.push(dns);
+          } else {
+            rec.zone_id = String(r.zone_id || "");
+            rec.api_token = r.api_token && r.api_token !== TOKEN_SET
+              ? String(r.api_token)
+              : oldMap.get(recordKey(rec))?.api_token;
+            clean.push(rec);
+          }
+        } catch (e: any) {
+          jsonResponse(res, { error: `第 ${i + 1} 条记录：${e.message}` }, 400);
           return;
         }
       }
 
-      const clean = arr.map((r: any) => {
-        const key = recordKey(String(r.record_name || ""), r.record_type === "AAAA" ? "AAAA" : "A");
-        let token: string | undefined;
-        if (r.api_token && String(r.api_token) !== TOKEN_SET) {
-          // A real token was supplied (e.g. direct storage edit); keep it.
-          token = String(r.api_token);
-        } else if (String(r.api_token) === TOKEN_SET) {
-          // Frontend echoed the mask back — preserve the stored token.
-          const ex = oldMap.get(key);
-          token = ex ? ex.api_token : undefined;
-        } else {
-          // No token in payload — keep whatever was stored before.
-          const ex = oldMap.get(key);
-          token = ex ? ex.api_token : undefined;
-        }
-        return {
-          zone_id: String(r.zone_id || ""),
-          record_name: String(r.record_name || ""),
-          record_type: (r.record_type === "AAAA" ? "AAAA" : "A") as "A" | "AAAA",
-          source_node: Array.isArray(r.source_node)
-            ? r.source_node.map((x: any) => String(x))
-            : [],
-          ttl: Number(r.ttl) || 1,
-          proxied: !!r.proxied,
-          comment: r.comment ? String(r.comment) : undefined,
-          api_token: token,
-        };
-      });
-
       // Detect additions and deletions by diffing against the previously stored records.
       const oldKeys = new Set(oldMap.keys());
       const newKeys = new Set(
-        clean.map((r: any) => recordKey(r.record_name, r.record_type)),
+        clean.map((r: any) => recordKey(r)),
       );
       let added = 0;
       let removed = 0;
@@ -771,9 +823,15 @@ definePlugin({
           if (String(a[k] ?? "") !== String(b[k] ?? "")) out.push(label);
         };
         cmp("zone_id", "Zone");
+        cmp("record_line", "线路");
+        cmp("weight", "权重");
         cmp("record_name", "名称");
         cmp("record_type", "类型");
-        cmp("ttl", "TTL");
+        if (b.provider === "dnspod") {
+          if (configuredDNSPodTTL(a) !== configuredDNSPodTTL(b)) out.push("TTL");
+        } else {
+          cmp("ttl", "TTL");
+        }
         cmp("proxied", "代理");
         cmp("comment", "备注");
         const sa = (a.source_node || []).join(",");
@@ -783,7 +841,7 @@ definePlugin({
         return out;
       };
       clean.forEach((r: any) => {
-        const key = recordKey(r.record_name, r.record_type);
+        const key = recordKey(r);
         const old = oldMap.get(key);
         if (!old) {
           added++;
@@ -802,7 +860,7 @@ definePlugin({
         }
       });
       oldRecs.forEach((r: any) => {
-        if (!newKeys.has(recordKey(r.record_name, r.record_type))) {
+        if (!newKeys.has(recordKey(r))) {
           removed++;
           logSync(r, "delete", true, `删除记录 ${r.record_name} (${r.record_type})`);
         }
