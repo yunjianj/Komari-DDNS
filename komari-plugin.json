@@ -6,11 +6,11 @@
   },
   "short": "cf-ddns",
   "description": {
-    "zh_CN": "根据 Komari 节点上报的公网 IP，自动更新 Cloudflare 和腾讯云 DNSPod 解析记录，实现动态域名解析。",
-    "en": "Automatically update Cloudflare and Tencent Cloud DNSPod records from the public IP reported by a Komari node, providing dynamic DNS."
+    "zh_CN": "根据 Komari 节点上报的公网 IP，自动更新 Cloudflare、腾讯云 DNSPod 和华为云 DNS 解析记录。",
+    "en": "Update Cloudflare, Tencent Cloud DNSPod and Huawei Cloud DNS records from the public IP reported by a Komari node."
   },
   "author": "穿云箭",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "komari": ">=1.4.0",
   "entry": "script.js",
   "permissions": {
@@ -40,6 +40,16 @@
       {
         "key": "tencent_secret_key",
         "name": { "zh_CN": "腾讯云 SecretKey", "en": "Tencent Cloud SecretKey" },
+        "type": "string"
+      },
+      {
+        "key": "huawei_access_key",
+        "name": { "zh_CN": "华为云 Access Key (AK)", "en": "Huawei Cloud Access Key (AK)" },
+        "type": "string"
+      },
+      {
+        "key": "huawei_secret_key",
+        "name": { "zh_CN": "华为云 Secret Key (SK)", "en": "Huawei Cloud Secret Key (SK)" },
         "type": "string"
       },
       {

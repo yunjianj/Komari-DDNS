@@ -1,6 +1,10 @@
 import { definePlugin, server, jsonResponse } from "@komari-monitor/plugin-sdk";
 
 import { DNSPOD_DEFAULT_TTL, listDNSPodLines, syncDNSPodRecord } from "./dnspod";
+import {
+  HUAWEI_DEFAULT_LINE, HUAWEI_DEFAULT_TTL, HUAWEI_MAX_TTL, HUAWEI_MAX_WEIGHT,
+  listHuaweiLines, syncHuaweiRecord,
+} from "./huaweicloud";
 
 // Host modules (available when permissions.node is enabled). Kept as dynamic
 // require so the bundler leaves them external and the runtime resolves them.
@@ -11,17 +15,20 @@ interface PluginConfig {
   api_token?: string;
   tencent_secret_id?: string;
   tencent_secret_key?: string;
+  huawei_access_key?: string;
+  huawei_secret_key?: string;
   interval: number;
   notify: boolean;
   records?: string; // legacy JSON textbox, only used for one-time seeding
 }
 
 interface RecordConfig {
-  provider?: "dnspod";
+  provider?: "dnspod" | "huaweicloud";
   domain?: string;
   record_line?: string;
   record_line_name?: string;
   record_id?: number;
+  recordset_id?: string;
   weight?: number;
   zone_id?: string;
   record_name: string;
@@ -38,6 +45,7 @@ interface SyncContext {
   nodes: Record<string, any>;
   statuses: Record<string, any>;
   claimedDNSPodRecords: Set<string>;
+  claimedHuaweiRecords: Set<string>;
 }
 
 const CF_API = "https://api.cloudflare.com/client/v4";
@@ -136,6 +144,10 @@ function getRecords(config: PluginConfig): RecordConfig[] {
 }
 
 function recordKey(rec: RecordConfig): string {
+  if (rec.provider === "huaweicloud") {
+    const target = rec.recordset_id ? `id:${rec.recordset_id}` : `line:${rec.record_line || HUAWEI_DEFAULT_LINE}`;
+    return `huaweicloud:${rec.domain}#${rec.record_name}#${rec.record_type}#${target}`;
+  }
   if (rec.provider !== "dnspod") return `${rec.record_name}#${rec.record_type}`;
   const target = rec.record_id ? `id:${rec.record_id}` : `line:${rec.record_line || "默认"}`;
   return `dnspod:${rec.domain}#${rec.record_name}#${rec.record_type}#${target}`;
@@ -145,11 +157,47 @@ function normalizeDNSName(value: unknown): string {
   return String(value ?? "").trim().toLowerCase().replace(/\.$/, "");
 }
 
+function isDNSDomain(domain: string): boolean {
+  return domain.length <= 253 && /^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain);
+}
+
 function dnsPodCredentials(config: PluginConfig) {
   const secretId = String(config.tencent_secret_id ?? "").trim();
   const secretKey = String(config.tencent_secret_key ?? "").trim();
   if (!secretId || !secretKey) throw new Error("请在插件配置中填写腾讯云 SecretId 和 SecretKey");
   return { secretId, secretKey };
+}
+
+function huaweiCredentials(config: PluginConfig) {
+  const accessKey = String(config.huawei_access_key ?? "").trim();
+  const secretKey = String(config.huawei_secret_key ?? "").trim();
+  if (!accessKey || !secretKey) throw new Error("请在插件配置中填写华为云 AK 和 SK");
+  return { accessKey, secretKey };
+}
+
+function normalizeHuaweiRecord(rec: RecordConfig) {
+  const domain = normalizeDNSName(rec.domain);
+  const name = normalizeDNSName(rec.record_name);
+  if (!isDNSDomain(domain) || (name !== domain && !name.endsWith("." + domain))) {
+    throw new Error("解析域名必须是记录名称本身或其上级域名");
+  }
+  const ttl = rec.ttl_seconds === undefined ? HUAWEI_DEFAULT_TTL : rec.ttl_seconds;
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > HUAWEI_MAX_TTL) {
+    throw new Error(`华为云 TTL 必须为 1 到 ${HUAWEI_MAX_TTL} 秒的整数`);
+  }
+  if (rec.weight !== undefined &&
+      (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > HUAWEI_MAX_WEIGHT)) {
+    throw new Error(`华为云权重必须为 0 到 ${HUAWEI_MAX_WEIGHT} 的整数，或留空`);
+  }
+  const recordsetId = typeof rec.recordset_id === "string" ? rec.recordset_id.trim() : rec.recordset_id;
+  if (recordsetId !== undefined && (typeof recordsetId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(recordsetId))) {
+    throw new Error("华为云记录集 ID 格式无效");
+  }
+  const line = rec.record_line === undefined ? HUAWEI_DEFAULT_LINE : rec.record_line;
+  if (typeof line !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(line)) {
+    throw new Error("华为云线路 ID 格式无效，请选择可用线路");
+  }
+  return { ...rec, domain, record_name: name, record_line: line, recordset_id: recordsetId, ttl: undefined, ttl_seconds: ttl };
 }
 
 function configuredDNSPodTTL(rec: RecordConfig): number | undefined {
@@ -379,7 +427,8 @@ function logSync(
     record_type: rec.record_type,
     provider: rec.provider,
     record_line: rec.record_line,
-    record_id: rec.record_id,
+    record_line_name: rec.record_line_name,
+    record_id: rec.record_id ?? rec.recordset_id,
     action,
     success,
     detail,
@@ -413,6 +462,7 @@ async function syncRecord(
 
     const previous = loadState()[key] || {};
     let createdId: number | undefined;
+    let huaweiCreatedId: string | undefined;
     let action: "create" | "update" | "skip";
     let skipDetail: string;
     if (rec.provider === "dnspod") {
@@ -436,6 +486,16 @@ async function syncRecord(
       action = synced.action;
       if (action === "create") createdId = synced.id;
       skipDetail = "DNSPod 解析记录已符合配置";
+    } else if (rec.provider === "huaweicloud") {
+      const dns = normalizeHuaweiRecord(rec);
+      const synced = await syncHuaweiRecord(huaweiCredentials(config), {
+        domain: dns.domain, name: dns.record_name, type: dns.record_type, line: dns.record_line,
+        recordsetId: dns.recordset_id, ttl: dns.ttl_seconds, weight: dns.weight,
+      }, target.ip, ctx.claimedHuaweiRecords,
+      Date.now() - previous.huawei_created_at < 30_000 ? previous.huawei_created_id : undefined);
+      action = synced.action;
+      huaweiCreatedId = synced.createdId;
+      skipDetail = "华为云解析记录已符合配置";
     } else {
       const token = rec.api_token || config.api_token;
       if (!token) throw new Error("请配置 Cloudflare API Token");
@@ -465,6 +525,8 @@ async function syncRecord(
       last_update_at: action === "skip" ? previous.last_update_at : now,
       dnspod_created_id: createdId ?? previous.dnspod_created_id,
       dnspod_created_at: createdId === undefined ? previous.dnspod_created_at : Date.now(),
+      huawei_created_id: huaweiCreatedId ?? previous.huawei_created_id,
+      huawei_created_at: huaweiCreatedId === undefined ? previous.huawei_created_at : Date.now(),
     };
     saveState(state);
     if (action !== "skip" && config.notify) {
@@ -522,7 +584,7 @@ async function sendNotify(
       event: {
         event: "DDNS",
         emoji: "🌐",
-        message: `DDNS ${verb}：${rec.record_name}${rec.provider === "dnspod" ? ` [${rec.record_line || "默认"}]` : ""} → ${target.ip}（节点 ${target.name}）`,
+        message: `DDNS ${verb}：${rec.record_name}${rec.provider ? ` [${rec.record_line_name || rec.record_line || "默认"}]` : ""} → ${target.ip}（节点 ${target.name}）`,
         time: new Date().toISOString(),
         clients: [{ uuid: target.uuid }],
       },
@@ -568,7 +630,7 @@ async function syncAllRecords(): Promise<Record<string, any>> {
     );
   }
 
-  const ctx: SyncContext = { nodes, statuses, claimedDNSPodRecords: new Set() };
+  const ctx: SyncContext = { nodes, statuses, claimedDNSPodRecords: new Set(), claimedHuaweiRecords: new Set() };
   const results: Record<string, any>[] = [];
   for (const r of list) {
     try {
@@ -706,7 +768,7 @@ definePlugin({
         return;
       }
       const domain = normalizeDNSName(parseQuery(req).domain);
-      if (domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) {
+      if (!isDNSDomain(domain)) {
         jsonResponse(res, { error: "请输入完整的 DNSPod 解析域名" }, 400);
         return;
       }
@@ -714,6 +776,24 @@ definePlugin({
         const config = (await server.getConfig()) as unknown as PluginConfig;
         const lines = await listDNSPodLines(dnsPodCredentials(config), domain);
         jsonResponse(res, { lines });
+      } catch (e) {
+        jsonResponse(res, { error: e instanceof Error ? e.message : String(e) }, 502);
+      }
+    });
+
+    server.route("GET", "/cf-ddns/huaweicloud-lines", async (req: any, res: any) => {
+      if (!isAdmin(req)) {
+        jsonResponse(res, { error: "请以管理员身份登录" }, 401);
+        return;
+      }
+      const domain = normalizeDNSName(parseQuery(req).domain);
+      if (!isDNSDomain(domain)) {
+        jsonResponse(res, { error: "请输入完整的华为云公网解析域名" }, 400);
+        return;
+      }
+      try {
+        const config = (await server.getConfig()) as unknown as PluginConfig;
+        jsonResponse(res, await listHuaweiLines(huaweiCredentials(config), domain));
       } catch (e) {
         jsonResponse(res, { error: e instanceof Error ? e.message : String(e) }, 502);
       }
@@ -758,13 +838,13 @@ definePlugin({
       );
 
       const clean: RecordConfig[] = [];
-      const dnsPodKeys = new Set<string>();
+      const managedKeys = new Set<string>();
       for (let i = 0; i < arr.length; i++) {
         const r = arr[i] || {};
         const name = String(r.record_name || "").trim();
         try {
           if (!name.includes(".")) throw new Error("记录名称应为完整域名（FQDN）");
-          if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod") {
+          if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod" && r.provider !== "huaweicloud") {
             throw new Error("未知的 DNS 提供商");
           }
           const rec: RecordConfig = {
@@ -775,26 +855,28 @@ definePlugin({
             proxied: !!r.proxied,
             comment: r.comment ? String(r.comment) : undefined,
           };
-          if (r.provider === "dnspod") {
-            const dns = normalizeDNSPodRecord({
+          if (r.provider === "dnspod" || r.provider === "huaweicloud") {
+            const managed: RecordConfig = {
               ...rec,
-              provider: "dnspod",
+              provider: r.provider,
               domain: r.domain,
               record_line: r.record_line,
               record_line_name: typeof r.record_line_name === "string" ? r.record_line_name : undefined,
-              record_id: r.record_id,
               weight: r.weight,
               proxied: false,
               ttl: r.ttl,
               ttl_seconds: r.ttl_seconds,
-            });
+            };
+            const dns = r.provider === "dnspod"
+              ? normalizeDNSPodRecord({ ...managed, record_id: r.record_id })
+              : normalizeHuaweiRecord({ ...managed, recordset_id: r.recordset_id });
             const key = recordKey(dns);
-            if (dnsPodKeys.has(key)) throw new Error("DNSPod 记录配置重复");
-            if (dns.ttl_seconds === undefined) {
+            if (managedKeys.has(key)) throw new Error("解析记录配置重复");
+            if (r.provider === "dnspod" && dns.ttl_seconds === undefined) {
               const old = oldMap.get(key);
               dns.ttl_seconds = old ? configuredDNSPodTTL(old) : DNSPOD_DEFAULT_TTL;
             }
-            dnsPodKeys.add(key);
+            managedKeys.add(key);
             clean.push(dns);
           } else {
             rec.zone_id = String(r.zone_id || "");
@@ -829,6 +911,8 @@ definePlugin({
         cmp("record_type", "类型");
         if (b.provider === "dnspod") {
           if (configuredDNSPodTTL(a) !== configuredDNSPodTTL(b)) out.push("TTL");
+        } else if (b.provider === "huaweicloud") {
+          cmp("ttl_seconds", "TTL");
         } else {
           cmp("ttl", "TTL");
         }

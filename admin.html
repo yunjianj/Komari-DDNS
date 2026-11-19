@@ -167,6 +167,10 @@
       .field select[multiple] { height: 90px; }
       .field small { color: var(--muted); font-size: 12px; font-weight: 400; }
       .field small.line-error { color: var(--danger); }
+      #lineField { grid-column: 1 / -1; }
+      #lineLevels { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 8px; }
+      #lineLevels:empty { display: none; }
+      #lineField .line-warning { color: var(--warning); }
       #retryLines { align-self: flex-start; padding: 4px 8px; font-size: 12px; }
       .toggle { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
       .toggle input { display: none; }
@@ -201,7 +205,7 @@
       <header class="page-header">
         <div>
           <h2>Komari DDNS</h2>
-          <div class="sub">根据 Komari 节点上报的公网 IP 自动更新 Cloudflare 和腾讯云 DNSPod 解析记录</div>
+          <div class="sub">根据 Komari 节点上报的公网 IP 自动更新 Cloudflare、腾讯云 DNSPod 和华为云 DNS 解析记录</div>
         </div>
         <div class="theme-picker">
           <label for="themePicker">外观</label>
@@ -233,29 +237,33 @@
             <select id="fProvider">
               <option value="cloudflare">Cloudflare</option>
               <option value="dnspod">腾讯云 DNSPod（中国站）</option>
+              <option value="huaweicloud">华为云 DNS（中国站）</option>
             </select>
           </div>
-          <div class="field hidden" data-dnspod>
-            <label for="fDomain">DNSPod 解析域名</label>
+          <div class="field hidden" data-smart-dns>
+            <label for="fDomain">解析域名</label>
             <input type="text" id="fDomain" placeholder="example.com" />
           </div>
-          <div class="field hidden" data-dnspod>
-            <label for="fLine">线路类型</label>
+          <div class="field hidden" id="lineField" data-smart-dns>
+            <label for="fLine" id="lineLabel">线路类型</label>
             <select id="fLine" aria-describedby="lineStatus" disabled>
               <option value="">请先填写解析域名</option>
             </select>
+            <select id="fHuaweiCategory" class="hidden" aria-describedby="lineStatus" disabled></select>
+            <div id="lineLevels"></div>
+            <small id="huaweiDefaultHint" class="line-warning hidden">建议为同一主机名和记录类型配置全网默认线路，供未命中细分线路的访问者使用。</small>
             <small id="lineStatus" role="status"></small>
             <button type="button" id="retryLines" class="secondary hidden">重试加载</button>
           </div>
-          <div class="field hidden" data-dnspod>
+          <div class="field hidden" data-smart-dns>
             <label for="fWeight">权重</label>
             <input type="number" id="fWeight" min="0" max="100" step="1" placeholder="留空保留现有权重" />
-            <small>填写 0 关闭权重，1–100 设置权重。</small>
+            <small id="weightHelp"></small>
           </div>
-          <div class="field hidden" data-dnspod>
-            <label for="fRecordId">DNSPod 记录 ID</label>
+          <div class="field hidden" data-smart-dns>
+            <label for="fRecordId" id="recordIdLabel">记录 ID</label>
             <input type="number" id="fRecordId" min="1" step="1" placeholder="可选" />
-            <small>同名、同类型、同线路有多条记录时填写。</small>
+            <small id="recordIdHelp">同名、同类型、同线路有多条记录时填写。</small>
           </div>
           <div class="field">
             <label>类型</label>
@@ -296,10 +304,10 @@
               <option value="86400">1 天</option>
             </select>
           </div>
-          <div class="field hidden" data-dnspod>
-            <label for="fDNSPodTtl">TTL（秒）</label>
-            <input type="number" id="fDNSPodTtl" min="1" max="604800" step="1" aria-describedby="dnspodTtlHelp" />
-            <small id="dnspodTtlHelp">最低值取决于套餐，例如免费版 600 秒、专业版 60 秒。</small>
+          <div class="field hidden" data-smart-dns>
+            <label for="fFixedTtl">TTL（秒）</label>
+            <input type="number" id="fFixedTtl" min="1" max="604800" step="1" aria-describedby="fixedTtlHelp" />
+            <small id="fixedTtlHelp">最低值取决于套餐，例如免费版 600 秒、专业版 60 秒。</small>
           </div>
           <div class="field">
             <label>备注</label>
@@ -368,13 +376,30 @@
       var NODES_URL = "/cf-ddns/nodes";
       var STATUS_URL = "/cf-ddns/status";
       var SYNC_URL = "/cf-ddns/sync";
-      var DNSPOD_LINES_URL = "/cf-ddns/dnspod-lines";
+      var LINE_URLS = { dnspod: "/cf-ddns/dnspod-lines", huaweicloud: "/cf-ddns/huaweicloud-lines" };
+      var PROVIDER_NAMES = { dnspod: "腾讯云 DNSPod", huaweicloud: "华为云 DNS", cloudflare: "Cloudflare" };
+      var HUAWEI_DEFAULT_LINE = "default_view";
+      var HUAWEI_DEFAULT_TTL = 300;
+      var HUAWEI_MAX_TTL = 2147483647;
+      var HUAWEI_MAX_WEIGHT = 1000;
+      var HUAWEI_CATEGORIES = {
+        DEFAULT: "全网默认", ISP: "运营商线路", REGION: "地域线路",
+        CUSTOM: "自定义线路", GROUP: "线路分组", OTHER: "其他线路"
+      };
 
       var NODES = [];
       var records = [];
       var state = {};
       var editingIndex = -1;
       var lineLookupDomain = "";
+      var lineLookupProvider = "";
+      var huaweiLines = [];
+      var huaweiLineSelection;
+      var huaweiLineWarning = "";
+      var dnsPodLines = [];
+      var dnsPodLineSelection;
+      var dnsPodSavedChoice;
+      var dnsPodSavedLine = "";
       var lineLookupTimer;
       var lineLookupVersion = 0;
       var DNSPOD_DEFAULT_TTL = 600;
@@ -407,6 +432,10 @@
       function fmt(ts){ if(!ts) return "—"; try { return new Date(ts).toLocaleString(); } catch(e){ return ts; } }
       function msg(text, cls){ var m = document.getElementById("msg"); m.textContent = text || ""; m.className = "msg " + (cls||""); }
       function recordKey(rec){
+        if(rec.provider === "huaweicloud"){
+          var target = rec.recordset_id ? "id:" + rec.recordset_id : "line:" + (rec.record_line || HUAWEI_DEFAULT_LINE);
+          return ["huaweicloud:" + rec.domain, rec.record_name, rec.record_type, target].join("#");
+        }
         if(rec.provider !== "dnspod") return rec.record_name + "#" + rec.record_type;
         var target = rec.record_id ? "id:" + rec.record_id : "line:" + (rec.record_line || "默认");
         return ["dnspod:" + rec.domain, rec.record_name, rec.record_type, target].join("#");
@@ -450,19 +479,21 @@
           var tdName = el("td"); tdName.appendChild(el("span", "mono name", rec.record_name)); tr.appendChild(tdName);
           var tdType = el("td"); tdType.appendChild(el("span", "type", rec.record_type)); tr.appendChild(tdType);
           var tdSource = el("td"); tdSource.appendChild(sourceNodeText(rec.source_node)); tr.appendChild(tdSource);
-          var isDNSPod = rec.provider === "dnspod";
-          tr.appendChild(el("td", "", isDNSPod ? "腾讯云 DNSPod" : "Cloudflare"));
+          var isHuawei = rec.provider === "huaweicloud";
+          tr.appendChild(el("td", "", PROVIDER_NAMES[rec.provider] || "Cloudflare"));
           var tdOptions = el("td");
-          if(isDNSPod){
-            var weight = rec.weight === undefined ? "权重未设置" : rec.weight === 0 ? "权重关闭" : "权重 " + rec.weight;
-            var id = rec.record_id ? " · ID " + rec.record_id : "";
-            tdOptions.textContent = (rec.record_line_name || rec.record_line || "默认") + " · " + weight + id;
+          if(rec.provider){
+            var weight = rec.weight === undefined ? "权重未设置" : rec.weight === 0
+              ? (isHuawei ? "备用（权重 0）" : "权重关闭") : "权重 " + rec.weight;
+            var recordId = rec.recordset_id || rec.record_id;
+            var id = recordId ? " · ID " + recordId : "";
+            tdOptions.textContent = (rec.record_line_name || rec.record_line || (isHuawei ? "全网默认" : "默认")) + " · " + weight + id;
           } else {
             tdOptions.appendChild(proxiedTag(rec.proxied));
           }
           tr.appendChild(tdOptions);
-          var ttl = isDNSPod ? configuredDNSPodTTL(rec) : rec.ttl || 1;
-          var ttlLabel = isDNSPod ? (ttl === undefined ? "沿用现有 TTL" : ttl + " 秒") : ttlText(ttl);
+          var ttl = isHuawei ? (rec.ttl_seconds ?? HUAWEI_DEFAULT_TTL) : configuredDNSPodTTL(rec);
+          var ttlLabel = rec.provider ? (ttl === undefined ? "沿用现有 TTL" : ttl + " 秒") : ttlText(rec.ttl || 1);
           tr.appendChild(el("td", "", ttlLabel));
           var tdContent = el("td"); tdContent.appendChild(el("span", st.last_ip ? "mono ip" : "empty-cell", st.last_ip || "—")); tr.appendChild(tdContent);
           tr.appendChild(el("td", rec.comment ? "" : "empty-cell", rec.comment || "—"));
@@ -500,7 +531,8 @@
         document.getElementById("fProvider").value = rec.provider || "cloudflare";
         document.getElementById("fDomain").value = rec.domain || "";
         document.getElementById("fWeight").value = rec.weight ?? "";
-        document.getElementById("fRecordId").value = rec.record_id ?? "";
+        updateProviderFields();
+        document.getElementById("fRecordId").value = rec.recordset_id ?? rec.record_id ?? "";
         var ttlSelect = document.getElementById("fTtl");
         var customTtl = ttlSelect.querySelector("[data-custom]");
         if(customTtl) customTtl.remove();
@@ -512,12 +544,8 @@
           ttlSelect.appendChild(customTtl);
         }
         ttlSelect.value = String(ttl);
-        var dnsPodTtl = document.getElementById("fDNSPodTtl");
-        var dnsPodSeconds = rec.provider === "dnspod" ? configuredDNSPodTTL(rec) : DNSPOD_DEFAULT_TTL;
-        dnsPodTtl.value = dnsPodSeconds ?? "";
-        dnsPodTtl.placeholder = dnsPodSeconds === undefined ? "留空保留现有记录的 TTL" : "";
-        updateProviderFields();
-        scheduleDNSPodLines(0);
+        setFixedTtl(rec.provider || "cloudflare", rec);
+        scheduleLineLookup(0);
         document.getElementById("fComment").value = rec.comment || "";
         document.getElementById("fProxied").checked = !!rec.proxied;
         updateProxyText();
@@ -537,22 +565,57 @@
       }
 
       function updateProviderFields(){
-        var isDNSPod = document.getElementById("fProvider").value === "dnspod";
-        document.getElementById("proxyField").classList.toggle("hidden", isDNSPod);
-        document.getElementById("cloudflareTtlField").classList.toggle("hidden", isDNSPod);
-        document.querySelectorAll("[data-dnspod]").forEach(function(field){
-          field.classList.toggle("hidden", !isDNSPod);
+        var provider = document.getElementById("fProvider").value;
+        var smart = provider !== "cloudflare";
+        var isHuawei = provider === "huaweicloud";
+        document.getElementById("proxyField").classList.toggle("hidden", smart);
+        document.getElementById("cloudflareTtlField").classList.toggle("hidden", smart);
+        document.querySelectorAll("[data-smart-dns]").forEach(function(field){
+          field.classList.toggle("hidden", !smart);
         });
+        document.getElementById("fLine").classList.toggle("hidden", isHuawei);
+        document.getElementById("fHuaweiCategory").classList.toggle("hidden", !isHuawei);
+        document.getElementById("lineLabel").htmlFor = isHuawei ? "fHuaweiCategory" : "fLine";
+        document.getElementById("fWeight").max = isHuawei ? HUAWEI_MAX_WEIGHT : 100;
+        document.getElementById("weightHelp").textContent = isHuawei
+          ? "0 表示备用，1–1000 设置权重；留空时新记录默认 1，已有记录保留原值。"
+          : "填写 0 关闭权重，1–100 设置权重。";
+        document.getElementById("fRecordId").type = isHuawei ? "text" : "number";
+        document.getElementById("recordIdLabel").textContent = isHuawei ? "华为云记录集 ID" : "DNSPod 记录 ID";
+        document.getElementById("recordIdHelp").textContent = isHuawei
+          ? "同名、同类型、同线路有多个记录集时填写。记录集必须属于所选线路。"
+          : "同名、同类型、同线路有多条记录时填写。";
+        document.getElementById("fFixedTtl").max = isHuawei ? HUAWEI_MAX_TTL : 604800;
+        document.getElementById("fixedTtlHelp").textContent = isHuawei
+          ? "输入整数秒数，新记录默认 300 秒。"
+          : "最低值取决于套餐，例如免费版 600 秒、专业版 60 秒。";
+      }
+
+      function setFixedTtl(provider, previous){
+        var sameProvider = previous && previous.provider === provider;
+        var seconds = provider === "huaweicloud"
+          ? (sameProvider ? previous.ttl_seconds ?? HUAWEI_DEFAULT_TTL : HUAWEI_DEFAULT_TTL)
+          : (sameProvider ? configuredDNSPodTTL(previous) : DNSPOD_DEFAULT_TTL);
+        var input = document.getElementById("fFixedTtl");
+        input.value = seconds ?? "";
+        input.placeholder = seconds === undefined ? "留空保留现有记录的 TTL" : "";
       }
 
       function cancelLineLookup(){
         clearTimeout(lineLookupTimer);
         lineLookupVersion++;
         lineLookupDomain = "";
+        lineLookupProvider = "";
       }
 
-      function setLinePlaceholder(text){
-        var select = document.getElementById("fLine");
+      function showLineStatus(text, error){
+        var status = document.getElementById("lineStatus");
+        status.textContent = text || "";
+        status.classList.toggle("line-error", Boolean(error));
+      }
+
+      function setLinePlaceholder(provider, text){
+        var select = document.getElementById(provider === "huaweicloud" ? "fHuaweiCategory" : "fLine");
         var placeholder = el("option", "", text);
         placeholder.value = "";
         placeholder.disabled = true;
@@ -562,60 +625,168 @@
         return select;
       }
 
-      function scheduleDNSPodLines(delay){
-        cancelLineLookup();
-        var status = document.getElementById("lineStatus");
-        status.textContent = "";
-        status.classList.remove("line-error");
-        document.getElementById("retryLines").classList.add("hidden");
-        setLinePlaceholder("请先填写解析域名");
-        if(document.getElementById("fProvider").value !== "dnspod") return;
-        var domain = dnsName(document.getElementById("fDomain").value);
-        lineLookupDomain = domain;
-        if(domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) return;
-        setLinePlaceholder("正在加载可用线路…");
-        var version = lineLookupVersion;
-        lineLookupTimer = setTimeout(function(){ loadDNSPodLines(domain, version); }, delay);
-      }
-
-      async function loadDNSPodLines(domain, version){
-        var status = document.getElementById("lineStatus");
-        try {
-          var response = await fetch(DNSPOD_LINES_URL + "?domain=" + encodeURIComponent(domain), { credentials: "same-origin" });
-          var data = await response.json();
-          if(version !== lineLookupVersion) return;
-          if(!response.ok || !Array.isArray(data.lines)) throw new Error(data.error || "DNSPod 线路查询失败");
-          if(!data.lines.length){
-            setLinePlaceholder("该域名暂无可用线路");
-            return;
-          }
-
-          var previous = records[editingIndex];
-          var savedLine = previous && previous.provider === "dnspod" && dnsName(previous.domain || "") === domain
-            ? previous.record_line || "默认" : "";
-          var selected = data.lines.find(function(line){ return line.id === savedLine || line.value === savedLine; });
-          if(savedLine && !selected) selected = data.lines.find(function(line){ return line.name === savedLine; });
-          if(!savedLine) selected = data.lines.find(function(line){ return line.value === "默认"; });
-
-          var select = setLinePlaceholder("请选择线路");
-          data.lines.forEach(function(line){
-            var option = el("option", "", line.name);
-            // Keep the stored spelling of legacy lines when editing other fields.
-            option.value = line === selected && savedLine ? savedLine : line.value;
-            option.dataset.lineName = line.name;
-            option.selected = line === selected;
+      function renderLineLevels({ choices, path, levelNames, prefixId, onPathChange, rootSelect }){
+        var levels = document.getElementById("lineLevels");
+        levels.replaceChildren();
+        var prefix = [];
+        for(var level = 0; ; level++){
+          var options = new Map();
+          choices.forEach(function(line){
+            var item = line.path[level];
+            if(item) options.set(item.id, item.name);
+          });
+          if(!options.size) break;
+          var labelText = levelNames[level] || ("第 " + (level + 1) + " 级线路");
+          var usesRootSelect = level === 0 && rootSelect;
+          var select = usesRootSelect ? rootSelect : el("select");
+          if(!usesRootSelect) select.id = prefixId + level;
+          select.dataset.level = level;
+          var canUseParent = choices.some(function(line){ return line.path.length === level; });
+          var initial = el("option", "", canUseParent ? "使用上一级线路" : "请选择" + labelText);
+          initial.value = "";
+          initial.disabled = !canUseParent;
+          select.replaceChildren(initial);
+          select.disabled = false;
+          options.forEach(function(name, id){
+            var option = el("option", "", name);
+            option.value = id;
             select.appendChild(option);
           });
-          select.disabled = false;
+          var selected = path[level];
+          select.value = selected && options.has(selected.id) ? selected.id : "";
+          select.onchange = function(){
+            var next = prefix.slice(0, Number(this.dataset.level));
+            if(this.value) next.push({ id: this.value });
+            onPathChange(next);
+            document.getElementById(this.id)?.focus();
+          };
+          if(!usesRootSelect){
+            var field = el("div", "field");
+            var label = el("label", "", labelText);
+            label.htmlFor = select.id;
+            field.append(label, select);
+            levels.appendChild(field);
+          }
+          if(!select.value) break;
+          prefix.push({ id: select.value });
+          choices = choices.filter(function(line){ return line.path[level]?.id === select.value; });
+        }
+        return choices.find(function(line){ return line.path.length === prefix.length; });
+      }
+
+      function renderHuaweiLevels(path){
+        var category = document.getElementById("fHuaweiCategory").value;
+        var choices = huaweiLines.filter(function(line){ return line.category === category; });
+        if(category === "DEFAULT"){
+          document.getElementById("lineLevels").replaceChildren();
+          huaweiLineSelection = choices[0];
+        } else {
+          huaweiLineSelection = renderLineLevels({
+            choices: choices,
+            path: path,
+            levelNames: category === "ISP" ? ["运营商", "大区", "省市"] : ["线路", "地区", "省市或国家/地区"],
+            prefixId: "fHuaweiLine",
+            onPathChange: function(next){
+              showLineStatus(huaweiLineWarning);
+              renderHuaweiLevels(next);
+            }
+          });
+        }
+        document.getElementById("huaweiDefaultHint").classList.toggle("hidden",
+          !huaweiLineSelection || category === "DEFAULT");
+      }
+
+      function renderHuaweiLines(data, savedLine){
+        huaweiLines = data.lines;
+        huaweiLineWarning = data.warning || "";
+        var select = setLinePlaceholder("huaweicloud", "请选择线路类型");
+        var selected = huaweiLines.find(function(line){ return line.path.at(-1).id === (savedLine || HUAWEI_DEFAULT_LINE); });
+        Object.keys(HUAWEI_CATEGORIES).forEach(function(category){
+          if(!huaweiLines.some(function(line){ return line.category === category; })) return;
+          var option = el("option", "", HUAWEI_CATEGORIES[category]);
+          option.value = category;
+          select.appendChild(option);
+        });
+        select.disabled = false;
+        select.value = selected ? selected.category : "";
+        renderHuaweiLevels(selected ? selected.path : []);
+        return selected;
+      }
+
+      function renderDNSPodLevels(path){
+        dnsPodLineSelection = renderLineLevels({
+          choices: dnsPodLines,
+          path: path,
+          levelNames: ["线路", "子线路"],
+          prefixId: "fDNSPodLine",
+          rootSelect: document.getElementById("fLine"),
+          onPathChange: function(next){
+            showLineStatus("");
+            renderDNSPodLevels(next);
+          }
+        });
+      }
+
+      function renderDNSPodLines(lines, savedLine){
+        dnsPodLines = lines;
+        dnsPodSavedLine = savedLine;
+        dnsPodSavedChoice = savedLine ? lines.find(function(line){
+          return line.id === savedLine || line.value === savedLine;
+        }) || lines.find(function(line){ return line.name === savedLine; }) : undefined;
+        var selected = savedLine ? dnsPodSavedChoice : lines.find(function(line){ return line.value === "默认"; });
+        renderDNSPodLevels(selected ? selected.path : []);
+        return selected;
+      }
+
+      function scheduleLineLookup(delay){
+        cancelLineLookup();
+        showLineStatus("");
+        document.getElementById("retryLines").classList.add("hidden");
+        document.getElementById("lineLevels").replaceChildren();
+        document.getElementById("huaweiDefaultHint").classList.add("hidden");
+        huaweiLines = [];
+        huaweiLineSelection = undefined;
+        huaweiLineWarning = "";
+        dnsPodLines = [];
+        dnsPodLineSelection = undefined;
+        dnsPodSavedChoice = undefined;
+        dnsPodSavedLine = "";
+        var provider = document.getElementById("fProvider").value;
+        if(!LINE_URLS[provider]) return;
+        setLinePlaceholder(provider, "请先填写解析域名");
+        var domain = dnsName(document.getElementById("fDomain").value);
+        lineLookupDomain = domain;
+        lineLookupProvider = provider;
+        if(domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) return;
+        setLinePlaceholder(provider, "正在加载可用线路…");
+        var version = lineLookupVersion;
+        lineLookupTimer = setTimeout(function(){ loadLines(provider, domain, version); }, delay);
+      }
+
+      async function loadLines(provider, domain, version){
+        try {
+          var response = await fetch(LINE_URLS[provider] + "?domain=" + encodeURIComponent(domain), { credentials: "same-origin" });
+          var data = await response.json();
+          if(version !== lineLookupVersion) return;
+          if(!response.ok || !Array.isArray(data.lines)) throw new Error(data.error || "线路查询失败");
+          if(!data.lines.length){
+            setLinePlaceholder(provider, "该域名暂无可用线路");
+            return;
+          }
+          var previous = records[editingIndex];
+          var sameDomain = previous && previous.provider === provider && dnsName(previous.domain || "") === domain;
+          var isHuawei = provider === "huaweicloud";
+          var savedLine = sameDomain ? previous.record_line || (isHuawei ? HUAWEI_DEFAULT_LINE : "默认") : "";
+          var selected = isHuawei ? renderHuaweiLines(data, savedLine) : renderDNSPodLines(data.lines, savedLine);
           if(savedLine && !selected){
-            status.textContent = "原线路（" + (previous.record_line_name || savedLine) + "）当前不可用，请重新选择。";
-            status.classList.add("line-error");
+            showLineStatus("原线路（" + (previous.record_line_name || savedLine) + "）当前不可用，请重新选择。", true);
+          } else {
+            showLineStatus(data.warning);
           }
         } catch(e){
           if(version !== lineLookupVersion) return;
-          setLinePlaceholder("线路加载失败");
-          status.textContent = e.message;
-          status.classList.add("line-error");
+          setLinePlaceholder(provider, "线路加载失败");
+          showLineStatus(e.message, true);
           document.getElementById("retryLines").classList.remove("hidden");
         }
       }
@@ -629,12 +800,16 @@
         if(!rec.record_name){ return "请输入记录名称"; }
         if(!rec.record_name.includes(".")){ return "记录名称应为完整域名（FQDN）"; }
         if(!rec.source_node || rec.source_node.length === 0){ return "请至少选择一个来源节点"; }
-        if(rec.provider === "dnspod"){
+        if(rec.provider){
           if(!rec.domain.includes(".") || (rec.record_name !== rec.domain && !rec.record_name.endsWith("." + rec.domain))){
             return "解析域名必须是记录名称本身或其上级域名";
           }
-          if(rec.weight !== undefined && (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > 100)){
-            return "权重必须是 0 到 100 的整数，或留空";
+          var maxWeight = rec.provider === "huaweicloud" ? HUAWEI_MAX_WEIGHT : 100;
+          if(rec.weight !== undefined && (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > maxWeight)){
+            return "权重必须是 0 到 " + maxWeight + " 的整数，或留空";
+          }
+          if(rec.recordset_id !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(rec.recordset_id)){
+            return "华为云记录集 ID 格式无效";
           }
           if(rec.record_id !== undefined && (!Number.isSafeInteger(rec.record_id) || rec.record_id < 1)){
             return "DNSPod 记录 ID 必须是正整数，或留空";
@@ -667,19 +842,21 @@
       document.getElementById("fProxied").onchange = updateProxyText;
       document.getElementById("fProvider").onchange = function(){
         updateProviderFields();
-        if(this.value === "dnspod" && lineLookupDomain !== dnsName(document.getElementById("fDomain").value)){
-          scheduleDNSPodLines(0);
-        }
+        var previous = records[editingIndex];
+        document.getElementById("fRecordId").value = previous?.provider === this.value
+          ? previous.recordset_id ?? previous.record_id ?? "" : "";
+        document.getElementById("fWeight").value = previous?.provider === this.value ? previous.weight ?? "" : "";
+        setFixedTtl(this.value, previous);
+        scheduleLineLookup(0);
       };
       document.getElementById("fDomain").oninput = function(){
-        if(lineLookupDomain !== dnsName(this.value)) scheduleDNSPodLines(350);
+        if(lineLookupDomain !== dnsName(this.value)) scheduleLineLookup(350);
       };
-      document.getElementById("fLine").onchange = function(){
-        var status = document.getElementById("lineStatus");
-        status.textContent = "";
-        status.classList.remove("line-error");
+      document.getElementById("fHuaweiCategory").onchange = function(){
+        showLineStatus(huaweiLineWarning);
+        renderHuaweiLevels([]);
       };
-      document.getElementById("retryLines").onclick = function(){ scheduleDNSPodLines(0); };
+      document.getElementById("retryLines").onclick = function(){ scheduleLineLookup(0); };
 
       document.getElementById("save").onclick = function(){
         var rec = {
@@ -690,37 +867,46 @@
           comment: document.getElementById("fComment").value.trim() || undefined,
         };
         var existing = records[editingIndex];
-        if(document.getElementById("fProvider").value === "dnspod"){
-          rec.provider = "dnspod";
+        var provider = document.getElementById("fProvider").value;
+        if(provider !== "cloudflare"){
+          rec.provider = provider;
           rec.domain = dnsName(document.getElementById("fDomain").value);
           rec.record_name = dnsName(rec.record_name);
-          var line = document.getElementById("fLine");
-          if(line.disabled || !line.value || rec.domain !== lineLookupDomain){
+          var isHuawei = provider === "huaweicloud";
+          var selection = isHuawei ? huaweiLineSelection : dnsPodLineSelection;
+          if(!selection || rec.domain !== lineLookupDomain || provider !== lineLookupProvider){
             msg("请填写解析域名并选择可用线路", "err");
             return;
           }
-          rec.record_line = line.value === "0" ? "默认" : line.value;
-          rec.record_line_name = line.selectedOptions[0].dataset.lineName;
+          if(isHuawei){
+            rec.record_line = selection.path.at(-1).id;
+          } else {
+            // Preserve the stored line name or ID when an existing record keeps its selection.
+            var value = selection === dnsPodSavedChoice ? dnsPodSavedLine : selection.value;
+            rec.record_line = value === "0" ? "默认" : value;
+          }
+          rec.record_line_name = selection.path.map(function(item){ return item.name; }).join(" / ");
           rec.proxied = false;
           var weight = document.getElementById("fWeight");
           var recordId = document.getElementById("fRecordId");
           if(!weight.checkValidity() || !recordId.checkValidity()){
-            msg("请填写有效的权重和 DNSPod 记录 ID", "err");
+            msg("请填写有效的权重和记录 ID", "err");
             return;
           }
           if(weight.value !== "") rec.weight = Number(weight.value);
-          if(recordId.value !== "") rec.record_id = Number(recordId.value);
-          var ttl = document.getElementById("fDNSPodTtl");
-          var keepExistingTtl = existing && existing.provider === "dnspod" &&
+          if(isHuawei) rec.recordset_id = recordId.value.trim() || undefined;
+          else if(recordId.value !== "") rec.record_id = Number(recordId.value);
+          var ttl = document.getElementById("fFixedTtl");
+          var keepExistingTtl = !isHuawei && existing && existing.provider === "dnspod" &&
             configuredDNSPodTTL(existing) === undefined && recordKey(existing) === recordKey(rec);
           if(!ttl.checkValidity() || (ttl.value === "" && !keepExistingTtl)){
-            msg("请输入 1 到 604800 秒的整数 TTL", "err");
+            msg("请输入 1 到 " + ttl.max + " 秒的整数 TTL", "err");
             return;
           }
           if(ttl.value !== "") rec.ttl_seconds = Number(ttl.value);
         } else {
           rec.ttl = Number(document.getElementById("fTtl").value) || 1;
-          if(existing && existing.provider !== "dnspod") rec.zone_id = existing.zone_id;
+          if(existing && !existing.provider) rec.zone_id = existing.zone_id;
         }
         var err = validate(rec);
         if(err){ msg(err, "err"); return; }
@@ -836,8 +1022,9 @@
           var tr = el("tr");
           var tdTime = el("td"); tdTime.textContent = fmt(l.time); tr.appendChild(tdTime);
           var tdName = el("td"); tdName.appendChild(el("span", "mono name", l.record_name || "—")); tr.appendChild(tdName);
-          if(l.provider === "dnspod"){
-            tdName.appendChild(el("div", "hint", "DNSPod · " + (l.record_line || "默认") + (l.record_id ? " · ID " + l.record_id : "")));
+          if(PROVIDER_NAMES[l.provider]){
+            tdName.appendChild(el("div", "hint", PROVIDER_NAMES[l.provider] + " · " +
+              (l.record_line_name || l.record_line || "默认") + (l.record_id ? " · ID " + l.record_id : "")));
           }
           var tdType = el("td"); tdType.appendChild(el("span", "type", l.record_type || "")); tr.appendChild(tdType);
           var tdAct = el("td"); tdAct.appendChild(el("span", "act " + l.action, actLabel(l.action))); tr.appendChild(tdAct);

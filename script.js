@@ -506,16 +506,18 @@ x-tc-action:${action.toLowerCase()}
     );
     if (!Array.isArray(LineList)) throw new Error("DNSPod \u7EBF\u8DEF\u5217\u8868\u54CD\u5E94\u683C\u5F0F\u5F02\u5E38");
     const lines = /* @__PURE__ */ new Map();
-    function collect(items) {
+    function collect(items, parents) {
       for (const { LineName: name, LineId: id, Useful, SubGroup } of items) {
+        const key = id || name;
+        const path2 = name && parents[parents.length - 1]?.id !== key ? [...parents, { id: key, name }] : parents;
         if (Useful && name) {
           const value = id === "0" ? "\u9ED8\u8BA4" : id && isLineId(id) ? id : name;
-          lines.set(value, { id, name, value });
+          lines.set(JSON.stringify(path2.map((part) => part.id)), { id, name, value, path: path2 });
         }
-        if (SubGroup) collect(SubGroup);
+        if (SubGroup) collect(SubGroup, path2);
       }
     }
-    collect(LineList);
+    collect(LineList, []);
     return Array.from(lines.values());
   }
   async function findRecords(credentials, options, lineId) {
@@ -624,6 +626,189 @@ x-tc-action:${action.toLowerCase()}
     return { action: "update", id: record.RecordId };
   }
 
+  // src/huaweicloud.ts
+  var DNS_HOST = "dns.cn-north-4.myhuaweicloud.com";
+  var HUAWEI_DEFAULT_LINE = "default_view";
+  var HUAWEI_DEFAULT_TTL = 300;
+  var HUAWEI_MAX_TTL = 2147483647;
+  var HUAWEI_MAX_WEIGHT = 1e3;
+  var HuaweiAPIError = class extends Error {
+    constructor(status, message) {
+      super(message);
+      this.status = status;
+    }
+  };
+  function encode(value) {
+    return encodeURIComponent(value).replace(
+      /[!'()*]/g,
+      (char) => "%" + char.charCodeAt(0).toString(16).toUpperCase()
+    );
+  }
+  async function request2(credentials, method, path2, query = {}, payload) {
+    const crypto = __require("crypto");
+    const sha256 = (input) => crypto.createHash("sha256").update(input).digest("hex");
+    const date = (/* @__PURE__ */ new Date()).toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const queryString = Object.keys(query).sort().map((key) => encode(key) + "=" + encode(query[key])).join("&");
+    const body = payload === void 0 ? "" : JSON.stringify(payload);
+    const headers = {
+      host: DNS_HOST,
+      "x-sdk-date": date
+    };
+    if (body) headers["content-type"] = "application/json";
+    const headerNames = Object.keys(headers).sort();
+    const canonicalHeaders = headerNames.map((name) => name + ":" + headers[name] + "\n").join("");
+    const signedHeaders = headerNames.join(";");
+    const canonicalRequest = [method, path2 + "/", queryString, canonicalHeaders, signedHeaders, sha256(body)].join("\n");
+    const algorithm = "SDK-HMAC-SHA256";
+    const signature = crypto.createHmac("sha256", credentials.secretKey).update([algorithm, date, sha256(canonicalRequest)].join("\n")).digest("hex");
+    headers.authorization = `${algorithm} Access=${credentials.accessKey}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+    const response = await fetch(`https://${DNS_HOST}${path2}${queryString ? "?" + queryString : ""}`, {
+      method,
+      headers,
+      body: body || void 0,
+      redirect: "error"
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || data.error_code || data.code) {
+      const code = data?.error_code || data?.code;
+      const detail = data?.error_msg || data?.message;
+      throw new HuaweiAPIError(response.status, `\u534E\u4E3A\u4E91 DNS ${method} ${path2} \u8FD4\u56DE HTTP ${response.status}` + (code ? ` (${code})` : "") + (detail ? `\uFF1A${detail}` : ""));
+    }
+    return data;
+  }
+  async function listPages(credentials, path2, field, query = {}, limit = 100) {
+    const items = [];
+    let offset = 0;
+    while (true) {
+      const page = await request2(credentials, "GET", path2, { ...query, limit: String(limit), offset: String(offset) });
+      const rows = page[field];
+      if (!Array.isArray(rows)) throw new Error(`\u534E\u4E3A\u4E91 DNS \u54CD\u5E94\u7F3A\u5C11 ${field} \u5217\u8868`);
+      items.push(...rows);
+      if (!rows.length) break;
+      offset += rows.length;
+      const total = page.metadata?.total_count;
+      if (!page.links?.next && (typeof total === "number" ? offset >= total : rows.length < limit)) break;
+    }
+    return items;
+  }
+  async function findZone(credentials, domain) {
+    const zones = await listPages(credentials, "/v2/zones", "zones", {
+      type: "public",
+      name: domain + ".",
+      search_mode: "equal"
+    });
+    const matches = zones.filter((zone) => zone.name.toLowerCase().replace(/\.$/, "") === domain);
+    if (matches.length !== 1 || !matches[0].id) throw new Error(`\u534E\u4E3A\u4E91 DNS \u65E0\u6CD5\u552F\u4E00\u5B9A\u4F4D\u516C\u7F51\u89E3\u6790\u57DF\u540D ${domain}`);
+    return matches[0].id;
+  }
+  function systemLineChoices(lines) {
+    const categories = /* @__PURE__ */ new Set(["DEFAULT", "ISP", "REGION"]);
+    const byId = new Map(lines.map((line) => [line.id, line]));
+    return Array.from(byId.values()).filter((line) => !categories.has(line.id)).map((line) => {
+      const path2 = [{ id: line.id, name: line.name }];
+      const seen = /* @__PURE__ */ new Set([line.id]);
+      let parentId = line.father_id;
+      while (parentId && !categories.has(parentId) && !seen.has(parentId)) {
+        const parent = byId.get(parentId);
+        if (!parent) break;
+        path2.unshift({ id: parent.id, name: parent.name });
+        seen.add(parentId);
+        parentId = parent.father_id;
+      }
+      const category = line.id === HUAWEI_DEFAULT_LINE ? "DEFAULT" : categories.has(parentId) ? parentId : "OTHER";
+      const labels = /* @__PURE__ */ new Set();
+      const displayPath = path2.map(({ id, name }) => {
+        const parts = name.split("_");
+        while (parts.length > 1 && labels.has(parts[0])) parts.shift();
+        const label = parts.join("_");
+        labels.add(label);
+        return { id, name: label };
+      });
+      return { category, path: displayPath };
+    });
+  }
+  async function listHuaweiLines(credentials, domain) {
+    await findZone(credentials, domain);
+    const warnings = [];
+    async function optionalLines(path2, field, category, permission) {
+      try {
+        const lines = await listPages(credentials, path2, field);
+        return lines.filter((line) => line.status === "ACTIVE" && line.line_id).map((line) => ({ category, path: [{ id: line.line_id, name: line.name }] }));
+      } catch (e) {
+        warnings.push(e instanceof HuaweiAPIError && e.status === 403 ? `\u7F3A\u5C11 ${permission} \u6743\u9650` : `\u65E0\u6CD5\u52A0\u8F7D${category === "CUSTOM" ? "\u81EA\u5B9A\u4E49\u7EBF\u8DEF" : "\u7EBF\u8DEF\u5206\u7EC4"}\uFF08${e instanceof Error ? e.message : String(e)}\uFF09`);
+        return [];
+      }
+    }
+    const [system, custom, groups] = await Promise.all([
+      listPages(credentials, "/v2.1/system-lines", "lines", { locale: "zh-cn" }, 1e3),
+      optionalLines("/v2.1/customlines", "lines", "CUSTOM", "dns:customLine:list"),
+      optionalLines("/v2.1/linegroups", "linegroups", "GROUP", "dns:lineGroup:list")
+    ]);
+    return { lines: [...systemLineChoices(system), ...custom, ...groups], warning: warnings.join("\uFF1B") };
+  }
+  async function syncHuaweiRecord(credentials, options, ip, claimed, recentlyCreatedId) {
+    const { domain, name, type, line, recordsetId, ttl, weight } = options;
+    const zoneId = await findZone(credentials, domain);
+    const path2 = `/v2.1/zones/${encode(zoneId)}/recordsets`;
+    const fqdn = name + ".";
+    const matchesRecord = (record2) => record2.name.toLowerCase().replace(/\.$/, "") === name && record2.type === type && record2.line === line;
+    let record;
+    if (recordsetId) {
+      record = await request2(credentials, "GET", path2 + "/" + encode(recordsetId));
+      if (record.id !== recordsetId || !matchesRecord(record)) {
+        throw new Error("\u534E\u4E3A\u4E91\u8BB0\u5F55\u96C6 ID \u4E0E\u6240\u9009\u4E3B\u673A\u540D\u3001\u7C7B\u578B\u6216\u7EBF\u8DEF\u4E0D\u5339\u914D");
+      }
+    } else {
+      const matches = (await listPages(credentials, path2, "recordsets", {
+        name: fqdn,
+        type,
+        line_id: line,
+        search_mode: "equal"
+      })).filter(matchesRecord);
+      if (matches.length > 1) throw new Error("\u534E\u4E3A\u4E91 DNS \u540C\u540D\u3001\u540C\u7C7B\u578B\u3001\u540C\u7EBF\u8DEF\u6709\u591A\u6761\u8BB0\u5F55\u96C6\uFF0C\u8BF7\u586B\u5199\u8BB0\u5F55\u96C6 ID");
+      record = matches[0];
+      if (!record && recentlyCreatedId) {
+        record = await request2(credentials, "GET", path2 + "/" + encode(recentlyCreatedId));
+        if (record.id !== recentlyCreatedId || !matchesRecord(record)) {
+          throw new Error("\u521A\u521B\u5EFA\u7684\u534E\u4E3A\u4E91\u8BB0\u5F55\u96C6\u4E0E\u5F53\u524D\u914D\u7F6E\u4E0D\u5339\u914D");
+        }
+      }
+    }
+    if (!record) {
+      const created = await request2(credentials, "POST", path2, {}, {
+        name: fqdn,
+        type,
+        line,
+        ttl,
+        weight,
+        records: [ip]
+      });
+      claimed.add(zoneId + "#" + created.id);
+      return { action: "create", createdId: created.id };
+    }
+    const key = zoneId + "#" + record.id;
+    if (claimed.has(key)) throw new Error("\u591A\u6761 DDNS \u914D\u7F6E\u6307\u5411\u540C\u4E00\u4E2A\u534E\u4E3A\u4E91\u8BB0\u5F55\u96C6");
+    claimed.add(key);
+    if (record.alias_target?.resource_type || record.alias_target?.resource_domain_name || !Array.isArray(record.records) || record.records.length !== 1) {
+      throw new Error("\u534E\u4E3A\u4E91 DDNS \u9700\u8981\u4EC5\u542B\u4E00\u4E2A IP \u7684\u975E\u522B\u540D\u8BB0\u5F55\u96C6");
+    }
+    const ipChanged = record.records[0] !== ip;
+    const ttlChanged = record.ttl !== ttl;
+    const weightChanged = weight !== void 0 && record.weight !== weight;
+    if (!ipChanged && !ttlChanged && !weightChanged) return { action: "skip" };
+    if (record.status && record.status !== "ACTIVE" && record.status !== "DISABLE") {
+      throw new Error(`\u534E\u4E3A\u4E91\u8BB0\u5F55\u96C6\u5F53\u524D\u72B6\u6001\u4E3A ${record.status}\uFF0C\u6682\u65F6\u65E0\u6CD5\u66F4\u65B0`);
+    }
+    await request2(credentials, "PUT", path2 + "/" + encode(record.id), {}, {
+      name: fqdn,
+      type,
+      records: ipChanged ? [ip] : void 0,
+      ttl: ttlChanged ? ttl : void 0,
+      weight: weightChanged ? weight : void 0
+    });
+    return { action: "update" };
+  }
+
   // src/plugin.ts
   var fs = __require("fs");
   var path = __require("path");
@@ -699,6 +884,10 @@ x-tc-action:${action.toLowerCase()}
     return stored;
   }
   function recordKey(rec) {
+    if (rec.provider === "huaweicloud") {
+      const target2 = rec.recordset_id ? `id:${rec.recordset_id}` : `line:${rec.record_line || HUAWEI_DEFAULT_LINE}`;
+      return `huaweicloud:${rec.domain}#${rec.record_name}#${rec.record_type}#${target2}`;
+    }
     if (rec.provider !== "dnspod") return `${rec.record_name}#${rec.record_type}`;
     const target = rec.record_id ? `id:${rec.record_id}` : `line:${rec.record_line || "\u9ED8\u8BA4"}`;
     return `dnspod:${rec.domain}#${rec.record_name}#${rec.record_type}#${target}`;
@@ -706,11 +895,43 @@ x-tc-action:${action.toLowerCase()}
   function normalizeDNSName(value) {
     return String(value ?? "").trim().toLowerCase().replace(/\.$/, "");
   }
+  function isDNSDomain(domain) {
+    return domain.length <= 253 && /^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain);
+  }
   function dnsPodCredentials(config) {
     const secretId = String(config.tencent_secret_id ?? "").trim();
     const secretKey = String(config.tencent_secret_key ?? "").trim();
     if (!secretId || !secretKey) throw new Error("\u8BF7\u5728\u63D2\u4EF6\u914D\u7F6E\u4E2D\u586B\u5199\u817E\u8BAF\u4E91 SecretId \u548C SecretKey");
     return { secretId, secretKey };
+  }
+  function huaweiCredentials(config) {
+    const accessKey = String(config.huawei_access_key ?? "").trim();
+    const secretKey = String(config.huawei_secret_key ?? "").trim();
+    if (!accessKey || !secretKey) throw new Error("\u8BF7\u5728\u63D2\u4EF6\u914D\u7F6E\u4E2D\u586B\u5199\u534E\u4E3A\u4E91 AK \u548C SK");
+    return { accessKey, secretKey };
+  }
+  function normalizeHuaweiRecord(rec) {
+    const domain = normalizeDNSName(rec.domain);
+    const name = normalizeDNSName(rec.record_name);
+    if (!isDNSDomain(domain) || name !== domain && !name.endsWith("." + domain)) {
+      throw new Error("\u89E3\u6790\u57DF\u540D\u5FC5\u987B\u662F\u8BB0\u5F55\u540D\u79F0\u672C\u8EAB\u6216\u5176\u4E0A\u7EA7\u57DF\u540D");
+    }
+    const ttl = rec.ttl_seconds === void 0 ? HUAWEI_DEFAULT_TTL : rec.ttl_seconds;
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > HUAWEI_MAX_TTL) {
+      throw new Error(`\u534E\u4E3A\u4E91 TTL \u5FC5\u987B\u4E3A 1 \u5230 ${HUAWEI_MAX_TTL} \u79D2\u7684\u6574\u6570`);
+    }
+    if (rec.weight !== void 0 && (!Number.isInteger(rec.weight) || rec.weight < 0 || rec.weight > HUAWEI_MAX_WEIGHT)) {
+      throw new Error(`\u534E\u4E3A\u4E91\u6743\u91CD\u5FC5\u987B\u4E3A 0 \u5230 ${HUAWEI_MAX_WEIGHT} \u7684\u6574\u6570\uFF0C\u6216\u7559\u7A7A`);
+    }
+    const recordsetId = typeof rec.recordset_id === "string" ? rec.recordset_id.trim() : rec.recordset_id;
+    if (recordsetId !== void 0 && (typeof recordsetId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(recordsetId))) {
+      throw new Error("\u534E\u4E3A\u4E91\u8BB0\u5F55\u96C6 ID \u683C\u5F0F\u65E0\u6548");
+    }
+    const line = rec.record_line === void 0 ? HUAWEI_DEFAULT_LINE : rec.record_line;
+    if (typeof line !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(line)) {
+      throw new Error("\u534E\u4E3A\u4E91\u7EBF\u8DEF ID \u683C\u5F0F\u65E0\u6548\uFF0C\u8BF7\u9009\u62E9\u53EF\u7528\u7EBF\u8DEF");
+    }
+    return { ...rec, domain, record_name: name, record_line: line, recordset_id: recordsetId, ttl: void 0, ttl_seconds: ttl };
   }
   function configuredDNSPodTTL(rec) {
     return rec.ttl_seconds !== void 0 ? rec.ttl_seconds : rec.ttl === 1 ? void 0 : rec.ttl;
@@ -888,7 +1109,8 @@ x-tc-action:${action.toLowerCase()}
       record_type: rec.record_type,
       provider: rec.provider,
       record_line: rec.record_line,
-      record_id: rec.record_id,
+      record_line_name: rec.record_line_name,
+      record_id: rec.record_id ?? rec.recordset_id,
       action,
       success,
       detail,
@@ -915,6 +1137,7 @@ x-tc-action:${action.toLowerCase()}
       }
       const previous = loadState()[key] || {};
       let createdId;
+      let huaweiCreatedId;
       let action;
       let skipDetail;
       if (rec.provider === "dnspod") {
@@ -938,6 +1161,26 @@ x-tc-action:${action.toLowerCase()}
         action = synced.action;
         if (action === "create") createdId = synced.id;
         skipDetail = "DNSPod \u89E3\u6790\u8BB0\u5F55\u5DF2\u7B26\u5408\u914D\u7F6E";
+      } else if (rec.provider === "huaweicloud") {
+        const dns = normalizeHuaweiRecord(rec);
+        const synced = await syncHuaweiRecord(
+          huaweiCredentials(config),
+          {
+            domain: dns.domain,
+            name: dns.record_name,
+            type: dns.record_type,
+            line: dns.record_line,
+            recordsetId: dns.recordset_id,
+            ttl: dns.ttl_seconds,
+            weight: dns.weight
+          },
+          target.ip,
+          ctx.claimedHuaweiRecords,
+          Date.now() - previous.huawei_created_at < 3e4 ? previous.huawei_created_id : void 0
+        );
+        action = synced.action;
+        huaweiCreatedId = synced.createdId;
+        skipDetail = "\u534E\u4E3A\u4E91\u89E3\u6790\u8BB0\u5F55\u5DF2\u7B26\u5408\u914D\u7F6E";
       } else {
         const token = rec.api_token || config.api_token;
         if (!token) throw new Error("\u8BF7\u914D\u7F6E Cloudflare API Token");
@@ -964,7 +1207,9 @@ x-tc-action:${action.toLowerCase()}
         last_checked_at: now,
         last_update_at: action === "skip" ? previous.last_update_at : now,
         dnspod_created_id: createdId ?? previous.dnspod_created_id,
-        dnspod_created_at: createdId === void 0 ? previous.dnspod_created_at : Date.now()
+        dnspod_created_at: createdId === void 0 ? previous.dnspod_created_at : Date.now(),
+        huawei_created_id: huaweiCreatedId ?? previous.huawei_created_id,
+        huawei_created_at: huaweiCreatedId === void 0 ? previous.huawei_created_at : Date.now()
       };
       saveState(state);
       if (action !== "skip" && config.notify) {
@@ -1008,7 +1253,7 @@ x-tc-action:${action.toLowerCase()}
         event: {
           event: "DDNS",
           emoji: "\u{1F310}",
-          message: `DDNS ${verb}\uFF1A${rec.record_name}${rec.provider === "dnspod" ? ` [${rec.record_line || "\u9ED8\u8BA4"}]` : ""} \u2192 ${target.ip}\uFF08\u8282\u70B9 ${target.name}\uFF09`,
+          message: `DDNS ${verb}\uFF1A${rec.record_name}${rec.provider ? ` [${rec.record_line_name || rec.record_line || "\u9ED8\u8BA4"}]` : ""} \u2192 ${target.ip}\uFF08\u8282\u70B9 ${target.name}\uFF09`,
           time: (/* @__PURE__ */ new Date()).toISOString(),
           clients: [{ uuid: target.uuid }]
         }
@@ -1049,7 +1294,7 @@ x-tc-action:${action.toLowerCase()}
         e
       );
     }
-    const ctx = { nodes, statuses, claimedDNSPodRecords: /* @__PURE__ */ new Set() };
+    const ctx = { nodes, statuses, claimedDNSPodRecords: /* @__PURE__ */ new Set(), claimedHuaweiRecords: /* @__PURE__ */ new Set() };
     const results = [];
     for (const r of list) {
       try {
@@ -1166,7 +1411,7 @@ x-tc-action:${action.toLowerCase()}
           return;
         }
         const domain = normalizeDNSName(parseQuery(req).domain);
-        if (domain.length > 253 || !/^[^\s./:@?#\\]+(?:\.[^\s./:@?#\\]+)+$/.test(domain)) {
+        if (!isDNSDomain(domain)) {
           (0, import_plugin_sdk.jsonResponse)(res, { error: "\u8BF7\u8F93\u5165\u5B8C\u6574\u7684 DNSPod \u89E3\u6790\u57DF\u540D" }, 400);
           return;
         }
@@ -1174,6 +1419,23 @@ x-tc-action:${action.toLowerCase()}
           const config = await import_plugin_sdk.server.getConfig();
           const lines = await listDNSPodLines(dnsPodCredentials(config), domain);
           (0, import_plugin_sdk.jsonResponse)(res, { lines });
+        } catch (e) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: e instanceof Error ? e.message : String(e) }, 502);
+        }
+      });
+      import_plugin_sdk.server.route("GET", "/cf-ddns/huaweicloud-lines", async (req, res) => {
+        if (!isAdmin(req)) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: "\u8BF7\u4EE5\u7BA1\u7406\u5458\u8EAB\u4EFD\u767B\u5F55" }, 401);
+          return;
+        }
+        const domain = normalizeDNSName(parseQuery(req).domain);
+        if (!isDNSDomain(domain)) {
+          (0, import_plugin_sdk.jsonResponse)(res, { error: "\u8BF7\u8F93\u5165\u5B8C\u6574\u7684\u534E\u4E3A\u4E91\u516C\u7F51\u89E3\u6790\u57DF\u540D" }, 400);
+          return;
+        }
+        try {
+          const config = await import_plugin_sdk.server.getConfig();
+          (0, import_plugin_sdk.jsonResponse)(res, await listHuaweiLines(huaweiCredentials(config), domain));
         } catch (e) {
           (0, import_plugin_sdk.jsonResponse)(res, { error: e instanceof Error ? e.message : String(e) }, 502);
         }
@@ -1210,13 +1472,13 @@ x-tc-action:${action.toLowerCase()}
           (r) => oldMap.set(recordKey(r), r)
         );
         const clean = [];
-        const dnsPodKeys = /* @__PURE__ */ new Set();
+        const managedKeys = /* @__PURE__ */ new Set();
         for (let i = 0; i < arr.length; i++) {
           const r = arr[i] || {};
           const name = String(r.record_name || "").trim();
           try {
             if (!name.includes(".")) throw new Error("\u8BB0\u5F55\u540D\u79F0\u5E94\u4E3A\u5B8C\u6574\u57DF\u540D\uFF08FQDN\uFF09");
-            if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod") {
+            if (r.provider && r.provider !== "cloudflare" && r.provider !== "dnspod" && r.provider !== "huaweicloud") {
               throw new Error("\u672A\u77E5\u7684 DNS \u63D0\u4F9B\u5546");
             }
             const rec = {
@@ -1227,26 +1489,26 @@ x-tc-action:${action.toLowerCase()}
               proxied: !!r.proxied,
               comment: r.comment ? String(r.comment) : void 0
             };
-            if (r.provider === "dnspod") {
-              const dns = normalizeDNSPodRecord({
+            if (r.provider === "dnspod" || r.provider === "huaweicloud") {
+              const managed = {
                 ...rec,
-                provider: "dnspod",
+                provider: r.provider,
                 domain: r.domain,
                 record_line: r.record_line,
                 record_line_name: typeof r.record_line_name === "string" ? r.record_line_name : void 0,
-                record_id: r.record_id,
                 weight: r.weight,
                 proxied: false,
                 ttl: r.ttl,
                 ttl_seconds: r.ttl_seconds
-              });
+              };
+              const dns = r.provider === "dnspod" ? normalizeDNSPodRecord({ ...managed, record_id: r.record_id }) : normalizeHuaweiRecord({ ...managed, recordset_id: r.recordset_id });
               const key = recordKey(dns);
-              if (dnsPodKeys.has(key)) throw new Error("DNSPod \u8BB0\u5F55\u914D\u7F6E\u91CD\u590D");
-              if (dns.ttl_seconds === void 0) {
+              if (managedKeys.has(key)) throw new Error("\u89E3\u6790\u8BB0\u5F55\u914D\u7F6E\u91CD\u590D");
+              if (r.provider === "dnspod" && dns.ttl_seconds === void 0) {
                 const old = oldMap.get(key);
                 dns.ttl_seconds = old ? configuredDNSPodTTL(old) : DNSPOD_DEFAULT_TTL;
               }
-              dnsPodKeys.add(key);
+              managedKeys.add(key);
               clean.push(dns);
             } else {
               rec.zone_id = String(r.zone_id || "");
@@ -1277,6 +1539,8 @@ x-tc-action:${action.toLowerCase()}
           cmp("record_type", "\u7C7B\u578B");
           if (b.provider === "dnspod") {
             if (configuredDNSPodTTL(a) !== configuredDNSPodTTL(b)) out.push("TTL");
+          } else if (b.provider === "huaweicloud") {
+            cmp("ttl_seconds", "TTL");
           } else {
             cmp("ttl", "TTL");
           }

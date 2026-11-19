@@ -1,8 +1,8 @@
 {
   "name": "komari-plugin-cf-ddns",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
-  "description": "DDNS plugin for Komari — sync a node's reported public IP to Cloudflare or Tencent Cloud DNSPod",
+  "description": "DDNS plugin for Komari — sync a node's public IP to Cloudflare, Tencent Cloud DNSPod or Huawei Cloud DNS",
   "scripts": {
     "check": "komari-plugin-dev check",
     "build": "komari-plugin-dev build",

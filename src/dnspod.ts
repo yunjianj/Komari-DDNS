@@ -13,6 +13,18 @@ interface LineItem {
   SubGroup?: LineItem[] | null;
 }
 
+interface LineOption {
+  id: string;
+  name: string;
+}
+
+interface DNSPodLine {
+  id: string | null;
+  name: string;
+  value: string;
+  path: LineOption[];
+}
+
 interface RecordOptions {
   domain: string;
   subdomain: string;
@@ -99,17 +111,22 @@ export async function listDNSPodLines(credentials: Credentials, domain: string) 
     credentials, "DescribeRecordLineCategoryList", { Domain: domain },
   );
   if (!Array.isArray(LineList)) throw new Error("DNSPod 线路列表响应格式异常");
-  const lines = new Map<string, { id: string | null; name: string; value: string }>();
-  function collect(items: LineItem[]): void {
+  const lines = new Map<string, DNSPodLine>();
+  function collect(items: LineItem[], parents: LineOption[]): void {
     for (const { LineName: name, LineId: id, Useful, SubGroup } of items) {
+      const key = id || name;
+      // DNSPod can repeat a parent line among its own children.
+      const path = name && parents[parents.length - 1]?.id !== key
+        ? [...parents, { id: key, name }]
+        : parents;
       if (Useful && name) {
         const value = id === "0" ? "默认" : id && isLineId(id) ? id : name;
-        lines.set(value, { id, name, value });
+        lines.set(JSON.stringify(path.map(part => part.id)), { id, name, value, path });
       }
-      if (SubGroup) collect(SubGroup);
+      if (SubGroup) collect(SubGroup, path);
     }
   }
-  collect(LineList);
+  collect(LineList, []);
   return Array.from(lines.values());
 }
 
